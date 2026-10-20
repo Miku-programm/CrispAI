@@ -41,11 +41,15 @@ create table if not exists public.project (
   payload         text,                                -- AI 系统提示词（<=5000 字，可为 JSON 字符串数组）
   options         jsonb       not null default '{}'::jsonb,   -- 欢迎语 {type:'none'|'text'|'option', text?, optionId?}
   timer           integer     not null default 1800,   -- 人工介入后多少秒恢复 AI
+  support         jsonb       not null default '{}'::jsonb, -- 在线/离线、未回复接管与频率屏蔽
   plan_id         text        not null default 'Free',
   expired_at      timestamptz not null default now(),
   renewal         boolean     not null default false,
   created_at      timestamptz not null default now()
 );
+
+-- 兼容已部署数据库；CREATE TABLE IF NOT EXISTS 不会补充列。
+alter table public.project add column if not exists support jsonb not null default '{}'::jsonb;
 
 -- worker 按 websiteId 查项目，同一个 websiteId 只能有一个项目
 create unique index if not exists project_website_id_key on public.project ("websiteId")
@@ -96,12 +100,53 @@ create table if not exists public.session (
   enable_reply boolean     not null default true,     -- AI 回复开关
   enable_time  timestamptz not null default now(),    -- 上次切换时间，switch.cron 据此恢复 AI
   thread       jsonb       not null default '[]'::jsonb,   -- 对话上下文
+  last_customer_at timestamptz,
+  last_human_at    timestamptz,
+  pending_since    timestamptz,
+  deadline_at      timestamptz,
+  pending_token    text,
+  pending_message  jsonb,
+  fallback_active  boolean not null default false,
+  fallback_action  text,
+  last_auto_reply_at timestamptz,
+  control_version  integer not null default 0,
   created_at   timestamptz not null default now()
 );
+
+alter table public.session add column if not exists last_customer_at timestamptz;
+alter table public.session add column if not exists last_human_at timestamptz;
+alter table public.session add column if not exists pending_since timestamptz;
+alter table public.session add column if not exists deadline_at timestamptz;
+alter table public.session add column if not exists pending_token text;
+alter table public.session add column if not exists pending_message jsonb;
+alter table public.session add column if not exists fallback_active boolean not null default false;
+alter table public.session add column if not exists fallback_action text;
+alter table public.session add column if not exists last_auto_reply_at timestamptz;
+alter table public.session add column if not exists control_version integer not null default 0;
 
 create index if not exists session_group_topic_idx on public.session (group_id, topic_id);
 create index if not exists session_website_id_idx  on public.session (website_id);
 create index if not exists session_enable_idx      on public.session (enable_reply, enable_time);
+create index if not exists session_deadline_idx on public.session (deadline_at)
+  where pending_token is not null;
+
+-- 屏蔽记录独立保存：清理过期会话或 Telegram 话题不会自动解除屏蔽。
+create table if not exists public.blocked_session (
+  website_id text not null,
+  session_id text not null,
+  reason text not null default '',
+  source text not null default 'manual' check (source in ('manual', 'abuse')),
+  created_at timestamptz not null default now(),
+  primary key (website_id, session_id)
+);
+
+-- Webhook redelivery must not repeat immediate human-takeover side effects.
+-- Session cleanup also removes entries older than its retention threshold.
+create table if not exists public.control_event (
+  event_key text primary key,
+  created_at timestamptz not null default now()
+);
+create index if not exists control_event_created_idx on public.control_event (created_at);
 
 -- ---------------------------------------------------------------------------
 -- 5. match_payloads(project, query_embedding, match_count)：知识库向量检索（余弦相似度）

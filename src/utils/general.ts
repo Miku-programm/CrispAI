@@ -10,7 +10,7 @@ export const createTelegramSession = async (
   const baseSession: Session = {
     website_id,
     session_id,
-    enable_reply: project.enableAI,
+    enable_reply: project.support.enabled ? false : project.enableAI,
     enable_time: new Date(),
     thread: [],
   };
@@ -45,7 +45,7 @@ export const createTelegramSession = async (
         reply_markup: telegram.changeAI(
           project.telegramId,
           topic.message_thread_id,
-          project.enableAI
+          initial.enable_reply
         ),
       }
     );

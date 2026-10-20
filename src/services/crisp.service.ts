@@ -1,11 +1,13 @@
-import * as db from "@/services/db.service";
 import axios from "axios";
+import * as db from "@/services/db.service";
 import type { Context } from "hono";
 import logger from "./logger.service";
 import messageSendTask from "@/jobs/messageSend.task";
 import messageReceivedTask from "@/jobs/messageReceived.task";
 import messageUpdatedTask from "@/jobs/messageUpdated.task";
 import { enqueue } from "@/utils/queue";
+import { eventJobId } from "@/services/sessionQueue.service";
+import { checkAbuse, markHumanActivity } from "@/services/support.service";
 
 const crisp = axios.create({
   baseURL: "https://api.crisp.chat/v1",
@@ -36,129 +38,75 @@ crisp.interceptors.response.use(
   },
 );
 
-type MessageBuffer = {
-  messages: any[];
-  timer: NodeJS.Timeout | null;
-  // 已轮询次数
-  ticks: number;
-};
+export const crispEventJobId = (event: string, data: any) =>
+  data?.fingerprint === undefined || data?.fingerprint === null
+    ? undefined
+    : eventJobId("crisp", event, data.website_id, data.session_id,
+        data.fingerprint, event === "message:updated" ? data.content : null);
 
-const bufferMap: Record<string, MessageBuffer> = {};
-const INTERVAL = parseInt(Bun.env.MSG_BUFFER_INTERVAL || "3000", 10);
-// 等待 session 建好的最长时间，超时后直接把剩余消息投递出去并停止轮询。
-// 之前 session 一直建不出来（项目不存在/被禁用）时定时器会永远跑下去，每 3 秒查一次数据库，
-// 越积越多，最后查询报错变成未处理的 Promise 拒绝把进程打挂
-const MAX_WAIT = parseInt(Bun.env.MSG_BUFFER_MAX_WAIT || "60000", 10);
-const MAX_TICKS = Math.max(1, Math.ceil(MAX_WAIT / INTERVAL));
-
-const createJob = (data: any) =>
-  enqueue(messageSendTask.queue, "messageSend", data);
-
-// 停掉定时器并删除缓存，返回尚未投递的消息
-const clearBuffer = (sessionId: string) => {
-  const buf = bufferMap[sessionId];
-  if (!buf) return [];
-  if (buf.timer) clearInterval(buf.timer);
-  delete bufferMap[sessionId];
-  return buf.messages.splice(0);
-};
-
-// 停掉定时器，把剩余消息全部投递出去
-const flushBuffer = (sessionId: string, reason: string) => {
-  const buffered = clearBuffer(sessionId);
-  logger.info(reason, { sessionId, count: buffered.length });
-  for (const msg of buffered) {
-    createJob(msg);
-  }
-};
-
-export const bufferMessage = async (data: any) => {
-  const cleanSessionId = data.session_id.replace("session_", "");
-
-  // 初始化 buffer
-  const buf = (bufferMap[cleanSessionId] ??= {
-    messages: [],
-    timer: null,
-    ticks: 0,
+// 保留旧导出以兼容调用方；现在直接持久化，不再用进程内定时缓存。
+// 同一会话的后续消息会等第一条建好会话后再执行。
+export const bufferMessage = async (data: any) =>
+  enqueue(messageSendTask.queue, "messageSend", data, {
+    jobId: crispEventJobId("message:send", data),
   });
-  buf.messages.push(data);
 
-  // 如果已经有定时器，说明之前在等，不要重复设置
-  if (buf.timer) {
-    return;
-  }
-
-  // 启动定时器检查
-  buf.timer = setInterval(async () => {
-    const buf = bufferMap[cleanSessionId];
-    if (!buf) return;
-    buf.ticks += 1;
-
-    try {
-      const session = await db.getSession(cleanSessionId);
-
-      if (session) {
-        // ✅ session 已建好 → flush 剩下的消息
-        flushBuffer(cleanSessionId, "Session ready, flushing remaining messages");
-        return;
-      }
-
-      // ❌ 没有 session → 取第一条出来建，其他消息继续留在队列里，等下次检查
-      const firstMsg = buf.messages.shift();
-      if (firstMsg) {
-        logger.info("No session, using first message to create", {
-          sessionId: cleanSessionId,
-        });
-        createJob(firstMsg);
-      }
-
-      if (buf.messages.length === 0) {
-        // 没有需要等待投递的消息了，停止轮询；后续再来消息会重新建 buffer
-        clearBuffer(cleanSessionId);
-        return;
-      }
-
-      if (buf.ticks >= MAX_TICKS) {
-        logger.warn("Session not ready in time", {
-          sessionId: cleanSessionId,
-          waitedMs: buf.ticks * INTERVAL,
-        });
-        flushBuffer(cleanSessionId, "Session wait timeout, flushing remaining messages");
-      }
-    } catch (error) {
-      // 查询失败（网络抖动、数据库短暂不可用）只记录日志，下一轮继续
-      logger.error("检查 session 失败", {
-        sessionId: cleanSessionId,
-        message: error instanceof Error ? error.message : String(error),
-      });
-      if (buf.ticks >= MAX_TICKS) {
-        flushBuffer(cleanSessionId, "Session check kept failing, flushing remaining messages");
-      }
-    }
-  }, INTERVAL);
-};
+// Count arrival rate before a slow AI job can build a backlog. Repeated webhook
+// deliveries share their fingerprint-derived member in the abuse window.
+async function allowCustomerEvent(event: string, data: any): Promise<boolean> {
+  const project = await db.getProject(data.website_id);
+  if (!project) return false;
+  return !(await checkAbuse(
+    project, data.session_id.replace(/^session_/, ""), crispEventJobId(event, data),
+  ));
+}
 
 export const crispWebhook = async (c: Context) => {
   const body = await c.req.json();
+  // Preserve first local arrival time through queue backlogs and legacy bridges.
+  // This field is assigned after webhook signature validation by the route.
+  if (body.data && typeof body.data === "object") body.data._received_at = Date.now();
 
   switch (body.event) {
     case "message:send":
+      if (!(await allowCustomerEvent(body.event, body.data))) {
+        return c.json({ ok: true, skipped: true });
+      }
       await bufferMessage(body.data);
       break;
     case "message:received":
       const { origin } = body.data;
-      if (origin === Bun.env.CRISP_URN) {
+      if (Bun.env.CRISP_URN && origin === Bun.env.CRISP_URN) {
         return c.json({ ok: true, skipped: true });
       }
-      enqueue(messageReceivedTask.queue, "messageReceived", body.data);
+      // Immediately invalidate an in-flight AI response before waiting in its
+      // conversation lane. The queued task still handles Telegram forwarding.
+      if (!body.data.user?.type) {
+        await markHumanActivity(
+          body.data.website_id,
+          body.data.session_id.replace(/^session_/, ""),
+          crispEventJobId(body.event, body.data),
+        );
+      }
+      await enqueue(messageReceivedTask.queue, "messageReceived", {
+        ...body.data,
+        human_activity_recorded: !body.data.user?.type,
+      }, {
+        jobId: crispEventJobId(body.event, body.data),
+      });
       break;
     case "message:updated":
       const { content } = body.data;
-      const isPicker = content.id ? true : false;
+      const isPicker = Boolean(content?.id);
       if (!isPicker) {
         return c.json({ ok: true, skipped: true });
       }
-      enqueue(messageUpdatedTask.queue, "messageUpdated", body.data);
+      if (!(await allowCustomerEvent(body.event, body.data))) {
+        return c.json({ ok: true, skipped: true });
+      }
+      await enqueue(messageUpdatedTask.queue, "messageUpdated", body.data, {
+        jobId: crispEventJobId(body.event, body.data),
+      });
       break;
     default:
       logger.warn("Unhandled Crisp event:", body.event);

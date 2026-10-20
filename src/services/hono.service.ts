@@ -53,6 +53,10 @@ hono.get("/intro.js", serveStatic({ root: WEB_DIR }));
 
 // /api/v1 里除 intro 外都需要认证，见 api/index.ts
 hono.route("/api/v1", api);
+hono.get("/support", authMiddleware, async (c) =>
+  c.html(await Bun.file(path.join(import.meta.dir, "../../web/support.html")).text()),
+);
+hono.get("/support/", authMiddleware, (c) => c.redirect("/support"));
 
 /**
  * 挂载管理页面。放在所有路由之后调用（index.ts 里 /jobs 挂完再调），

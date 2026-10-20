@@ -26,23 +26,20 @@ export default {
   }),
   concurrency: 100,
   processor: async (job: any) => {
-    const { data } = job;
-    const query = data.split("_");
-    if (query.length == 3) {
-      const action = query[0] === "close" ? false : true;
-      const group_id = parseInt(query[1]);
-      const topic_id = parseInt(query[2]);
-      await db.setSessionReplyByTopic(group_id, topic_id, action);
-
-      try {
-        await telegram.default.api.editMessageReplyMarkup(
-          group_id,
-          topic_id + 1,
-          {
-            reply_markup: telegram.changeAI(group_id, topic_id, action),
-          }
-        );
-      } catch {}
+    // New callbacks apply control at ingress, then serialize only the presentation update.
+    if (typeof job.data === "object") {
+      const session = await db.getSession(job.data.session_id);
+      if (session) await telegram.refreshSessionControls(session);
+    } else {
+      // Previously persisted callbacks retain their old string shape.
+      const match = /^(open|close)_(-?\d+)_(\d+)$/.exec(job.data);
+      if (match) {
+        const session = await db.getSessionByTopic(Number(match[2]), Number(match[3]));
+        if (session) {
+          await telegram.applySessionControl(session, match[1]!);
+          await telegram.refreshSessionControls(session);
+        }
+      }
     }
     return { success: true };
   },

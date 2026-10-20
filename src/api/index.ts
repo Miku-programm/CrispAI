@@ -10,6 +10,7 @@ import * as project from "@/api/project.controller";
 import * as option from "@/api/option.controller";
 import * as payload from "@/api/payload.controller";
 import * as transfer from "@/api/transfer.controller";
+import supportApi from "@/api/support.controller";
 
 /**
  * 管理后台接口（/api/v1）
@@ -33,12 +34,13 @@ api.post(
     z.object({ website_id: z.string().min(1), session_id: z.string().min(1) }),
   ),
   async (c) => {
-    enqueue(introTask.queue, "intro", await c.req.json());
+    await enqueue(introTask.queue, "intro", await c.req.json());
     return c.json({ message: "成功" });
   },
 );
 
 api.use("*", authMiddleware);
+api.route("/support", supportApi);
 
 // project
 api.get("/projects", project.listController);

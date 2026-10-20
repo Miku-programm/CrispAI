@@ -4,6 +4,7 @@ import { createResponse, createTelegramSession } from "@/utils/general";
 import { Queue } from "bullmq";
 import path from "path";
 import { connection } from "@/services/redis.service";
+import { markHumanActivity } from "@/services/support.service";
 
 const currentFileName = path.basename(
   import.meta.url,
@@ -30,9 +31,10 @@ export default {
     const { website_id, session_id, user } = job.data;
     const cleanSessionId = session_id.replace("session_", "");
     // handle origin crisp reply
-    if (!user.type) {
+    if (!user?.type) {
       const project = await db.getProject(website_id);
       if (!project) return createResponse(false, "项目不存在");
+      if (await db.isSessionBlocked(website_id, cleanSessionId)) return createResponse(true, "已屏蔽的会话");
 
       let session = await db.getSession(cleanSessionId);
       if (!session) {
@@ -44,10 +46,11 @@ export default {
       }
 
       // 客服每次回复都刷新 enable_time，恢复 AI 的倒计时从最后一次人工回复算起
-      await db.updateSession(cleanSessionId, {
-        enable_reply: false,
-        enable_time: new Date(),
-      });
+      if (!job.data.human_activity_recorded) await markHumanActivity(website_id, cleanSessionId);
+      if (job.data.type === "text" && typeof job.data.content === "string") {
+        session.thread.push({ role: "assistant", content: job.data.content });
+        await db.updateSession(cleanSessionId, { thread: session.thread });
+      }
       if (session.group_id && session.enable_reply) {
         try {
           await telegram.default.api.editMessageReplyMarkup(

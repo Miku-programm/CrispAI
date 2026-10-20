@@ -16,6 +16,10 @@ import type { Message } from "grammy/types";
 import ffmpeg from "fluent-ffmpeg";
 import axios from "axios";
 import { connection } from "@/services/redis.service";
+import { armTimeout, markHumanActivity, replyGuard } from "@/services/support.service";
+import { customerAction, isSupportOnline, noticeIsDue } from "@/services/support.policy";
+import type { SupportAction } from "@/types/support";
+import logger from "@/services/logger.service";
 
 const currentFileName = path.basename(
   import.meta.url,
@@ -46,6 +50,9 @@ export default {
     if (!project) {
       return createResponse(false, "未找到项目");
     }
+    if (await db.isSessionBlocked(website_id, cleanSessionId)) {
+      return createResponse(true, "已屏蔽的会话");
+    }
 
     let session = await db.getSession(cleanSessionId);
 
@@ -55,7 +62,7 @@ export default {
         session = null;
       }
     }
-    if (!session) {
+    if (!session || (project.telegramId && (!session.topic_id || !session.message_id))) {
       session = await createTelegramSession(
         cleanSessionId,
         website_id,
@@ -63,17 +70,22 @@ export default {
       );
     }
 
-    await crisp.composeMessage(website_id, session_id, true);
-
     const isText = job.data.type === "text";
+    const mediaType = typeof job.data.content?.type === "string" ? job.data.content.type : "";
+    const receivedAt = job.data._received_at || job.timestamp || Date.now();
+    await db.updateSession(cleanSessionId, { last_customer_at: new Date(receivedAt) });
+    const alreadyAnswered = session.last_human_at && new Date(session.last_human_at).getTime() >= receivedAt;
+    const action = alreadyAnswered ? "none" : customerAction(project.support, session);
+    const canReply = replyGuard(project, session);
 
     let telegramMessage;
+    if (await db.isSessionBlocked(website_id, cleanSessionId)) return createResponse(true, "已屏蔽的会话");
     if (project.telegramId) {
       if (isText) {
         try {
           const flow: string[] = [
             "🧾<b>消息内容</b>：",
-            emojiConverter(job.data.content),
+            telegram.escapeHTML(emojiConverter(job.data.content)),
           ];
           telegramMessage = await telegram.default.api.sendMessage(
             session.group_id!,
@@ -83,8 +95,8 @@ export default {
               parse_mode: "HTML",
             },
           );
-        } catch {}
-      } else if (job.data.content.type.includes("image")) {
+        } catch (error) { logger.warn("转发客户文本失败", { message: String(error) }); }
+      } else if (mediaType.includes("image")) {
         try {
           telegramMessage = await telegram.default.api.sendPhoto(
             session.group_id!,
@@ -97,7 +109,7 @@ export default {
         } catch {
           telegramMessage = undefined;
         }
-      } else if (job.data.content.type.includes("audio")) {
+      } else if (mediaType.includes("audio")) {
         const converter = async (url: string) => {
           const output = url.split("/").pop()!.split(".")[0] + ".mp3";
           const response = await axios.get(url, { responseType: "stream" });
@@ -131,29 +143,25 @@ export default {
       }
     }
 
-    const options = await db.getOption(project.id);
-
-    if (isText) {
-      const content = await handleTextMessage(
-        session,
-        job.data,
-        project,
-        options,
-      );
-      if (project.telegramId) {
-        await notifyTelegram(
-          session,
-          job.data.content,
-          content,
-          telegramMessage,
-        );
+    let content: string | undefined;
+    try {
+      if (action === "wait") {
+        recordCustomerMessage(session, job.data);
+        await db.updateSession(cleanSessionId, { thread: session.thread });
+        await armTimeout(project, session, job.data, receivedAt);
+      } else {
+        await crisp.composeMessage(website_id, session_id, true);
+        const notice = isSupportOnline(project.support) && session.fallback_active
+          ? project.support.timeout.message : project.support.offline.message;
+        content = await runAutomaticReply(session, job.data, project, action, canReply, true, notice);
       }
-    } else if (job.data.content.type.includes("image")) {
-      await handleImageMessage(session, job.data, project, telegramMessage);
+      if (isText && project.telegramId) {
+        await notifyTelegram(session, job.data.content, content, telegramMessage);
+      }
+      await db.updateSession(cleanSessionId, { thread: session.thread });
+    } finally {
+      await crisp.composeMessage(website_id, session_id, false);
     }
-    await crisp.composeMessage(website_id, session_id, false);
-
-    await db.updateSession(cleanSessionId, { thread: session.thread });
     return createResponse(true, "任务执行完成");
   },
 };
@@ -175,7 +183,9 @@ async function updateTelegramSession(session: Session, project: any) {
         reply_markup: telegram.changeAI(
           project.telegramId,
           session.topic_id!,
-          project.enableAI,
+          project.support.enabled
+            ? !!session.fallback_active && ["ai", "rules"].includes(session.fallback_action ?? "")
+            : session.enable_reply,
         ),
       },
     );
@@ -216,22 +226,24 @@ async function handleTextMessage(
   body: any,
   project: any,
   options: any[],
+  canReply: () => Promise<boolean>,
 ) {
   let content: string | undefined;
 
-  if (project.enableKeyword) {
-    const replyOption = getKeyword(body.content, project.keyword);
+  if (body.option_trigger || project.enableKeyword) {
+    const replyOption = body.option_trigger || getKeyword(body.content, project.keyword);
     content = await handleKeywordReply(
       replyOption,
       session,
       body,
       project,
       options,
+      canReply,
     );
   }
 
   if (!content && project.enableAI && session.enable_reply) {
-    content = await handleAIReply(session, body, project);
+    content = await handleAIReply(session, body, project, canReply);
   }
 
   return content;
@@ -243,9 +255,11 @@ async function handleKeywordReply(
   body: any,
   project: any,
   options: any[],
+  canReply: () => Promise<boolean>,
 ) {
   const { website_id, session_id } = body;
   if (!replyOption) return;
+  if (!(await canReply())) return;
 
   if (replyOption.type === "text") {
     await crisp.sendMessage(
@@ -274,7 +288,8 @@ async function handleKeywordReply(
 
   if (replyOption.type === "closeAI" && session.enable_reply) {
     const msg = "已关闭智能回复，请等待人工客服接入...";
-    await db.setSessionReply(session.session_id, false);
+    await markHumanActivity(body.website_id, session.session_id);
+    session.enable_reply = false;
     await crisp.sendMessage(
       website_id,
       session_id,
@@ -293,11 +308,12 @@ async function searchDocuments(project: string, query: string, matchCount = 3) {
 
   return await db.matchPayloads(project, vector, matchCount);
 }
-async function handleAIReply(session: Session, body: any, project: any) {
+async function handleAIReply(session: Session, body: any, project: any, canReply: () => Promise<boolean>, record = true) {
   const messages: ChatCompletionMessageParam[] = await buildMessages(
     session,
     body,
     project,
+    record,
   );
   const results = await searchDocuments(project.id, body.content);
   if (results && results.length > 0) {
@@ -323,8 +339,7 @@ async function handleAIReply(session: Session, body: any, project: any) {
   const reply = completion.choices[0]?.message;
   if (!reply?.content) return;
 
-  session.thread.push(reply);
-
+  if (!(await canReply())) return;
   await crisp.sendMessage(
     body.website_id,
     body.session_id,
@@ -332,6 +347,7 @@ async function handleAIReply(session: Session, body: any, project: any) {
     project.botName,
     project.botIcon,
   );
+  session.thread.push(reply);
 
   return reply.content;
 }
@@ -340,6 +356,7 @@ async function buildMessages(
   session: Session,
   body: any,
   project: any,
+  record = true,
 ): Promise<ChatCompletionMessageParam[]> {
   const messages: ChatCompletionMessageParam[] = [];
 
@@ -360,7 +377,7 @@ async function buildMessages(
 
   session?.thread.forEach((msg: any) => messages.push(msg));
 
-  if (body.content && typeof body.content === "string") {
+  if (record && body.content && typeof body.content === "string") {
     const msg: ChatCompletionMessageParam = {
       role: "user",
       content: body.content,
@@ -377,14 +394,17 @@ async function handleImageMessage(
   body: any,
   project: any,
   telegramMessage?: Message.TextMessage | Message.PhotoMessage,
+  canReply: () => Promise<boolean> = replyGuard(project, session),
+  record = true,
 ) {
   if (!project.enableAI || !project.enableAIPic) return;
 
-  const messages = await buildMessages(session, body, project);
-  messages.push({
+  const messages = await buildMessages(session, body, project, false);
+  const image: ChatCompletionMessageParam = {
     role: "user",
     content: [{ type: "image_url", image_url: { url: body.content.url } }],
-  });
+  };
+  if (record) { messages.push(image); session.thread.push(image); }
 
   const completion = await openai.chat.completions.create({
     messages,
@@ -394,9 +414,8 @@ async function handleImageMessage(
   if (!completion?.choices) return;
 
   const reply = completion.choices[0]?.message;
-  session.thread.push(reply);
-
   const replyText = reply?.content ?? "无法识别该图片";
+  if (!(await canReply())) return;
   await crisp.sendMessage(
     body.website_id,
     body.session_id,
@@ -404,6 +423,7 @@ async function handleImageMessage(
     project.botName,
     project.botIcon,
   );
+  if (reply) session.thread.push(reply);
 
   if (project.telegramId) {
     if (telegramMessage) {
@@ -412,7 +432,7 @@ async function handleImageMessage(
           session.group_id!,
           telegramMessage.message_id,
           {
-            caption: `💡<b>智能回复</b>：\n${replyText}`,
+            caption: `💡<b>智能回复</b>：\n${telegram.escapeHTML(replyText)}`,
             parse_mode: "HTML",
           },
         );
@@ -423,7 +443,7 @@ async function handleImageMessage(
           session.group_id!,
           body.content.url,
           {
-            caption: `💡<b>智能回复</b>：\n${replyText}`,
+            caption: `💡<b>智能回复</b>：\n${telegram.escapeHTML(replyText)}`,
             message_thread_id: session.topic_id,
             parse_mode: "HTML",
           },
@@ -431,6 +451,62 @@ async function handleImageMessage(
       } catch {}
     }
   }
+  return replyText;
+}
+
+export function recordCustomerMessage(session: Session, body: any) {
+  if (body.type === "text" && typeof body.content === "string") {
+    session.thread.push({ role: "user", content: body.content });
+  } else if (body.content?.type?.includes("image")) {
+    session.thread.push({ role: "user", content: [{ type: "image_url", image_url: { url: body.content.url } }] });
+  }
+}
+
+/** Shared by regular messages and delayed takeover jobs; no second Telegram forwarding occurs here. */
+export async function runAutomaticReply(
+  session: Session, body: any, project: any, action: SupportAction | "legacy",
+  canReply = replyGuard(project, session), record = true, notice?: string,
+): Promise<string | undefined> {
+  if (action === "none") { if (record) recordCustomerMessage(session, body); return; }
+  if (action === "message") {
+    if ((record && !noticeIsDue(session)) || !(await canReply())) {
+      if (record) recordCustomerMessage(session, body);
+      return;
+    }
+    const text = notice ?? project.support.offline.message;
+    if (!text) return;
+    await crisp.sendMessage(body.website_id, body.session_id, text, project.botName, project.botIcon);
+    if (record) recordCustomerMessage(session, body);
+    session.thread.push({ role: "assistant", content: text });
+    await db.updateSession(session.session_id, { last_auto_reply_at: new Date() });
+    return text;
+  }
+  if (body.type === "text") {
+    const options = await db.getOption(project.id);
+    if (action === "legacy") return handleTextMessage(session, body, project, options, canReply);
+    if (action === "rules" && (body.option_trigger || project.enableKeyword)) {
+      const matched = body.option_trigger || getKeyword(body.content, project.keyword);
+      const text = await handleKeywordReply(matched, session, body, project, options, canReply);
+      if (text) {
+        if (record) recordCustomerMessage(session, body);
+        session.thread.push({ role: "assistant", content: text });
+        return text;
+      }
+      // A closeAI rule invalidates the guard and must never fall through into AI.
+      if (!(await canReply())) return;
+    }
+    if (project.enableAI) return handleAIReply(session, body, project, canReply, record);
+    const fallback = notice ?? project.support.offline.message;
+    if (action === "rules" && fallback) {
+      return runAutomaticReply(session, body, project, "message", canReply, record, fallback);
+    }
+    if (record) recordCustomerMessage(session, body);
+    return;
+  }
+  if (body.content?.type?.includes("image") && (action !== "legacy" || session.enable_reply)) {
+    return handleImageMessage(session, body, project, undefined, canReply, record);
+  }
+  if (record) recordCustomerMessage(session, body);
 }
 
 async function notifyTelegram(
@@ -439,9 +515,10 @@ async function notifyTelegram(
   replyContent: string | undefined,
   telegramMessage?: Message.TextMessage | Message.PhotoMessage,
 ) {
-  const flow: string[] = ["🧾<b>消息内容</b>：", emojiConverter(userContent)];
+  if (await db.isSessionBlocked(session.website_id, session.session_id)) return;
+  const flow: string[] = ["🧾<b>消息内容</b>：", telegram.escapeHTML(emojiConverter(userContent))];
   if (replyContent) {
-    flow.push("", "💡<b>智能回复</b>：", replyContent);
+    flow.push("", "💡<b>智能回复</b>：", telegram.escapeHTML(replyContent));
   }
 
   try {
@@ -464,5 +541,5 @@ async function notifyTelegram(
         },
       );
     }
-  } catch {}
+  } catch (error) { logger.warn("更新 Telegram 回复失败", { message: String(error) }); }
 }

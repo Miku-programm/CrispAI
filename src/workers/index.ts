@@ -1,4 +1,4 @@
-import { Worker, Queue } from "bullmq";
+import { Worker, Queue, type Processor } from "bullmq";
 import { glob } from "glob";
 import logger from "@/services/logger.service";
 import { createBullBoard } from "@bull-board/api";
@@ -7,6 +7,13 @@ import { HonoAdapter } from "@bull-board/hono";
 import { serveStatic } from "hono/bun";
 import type { JobItem } from "@/types/job";
 import { connection } from "@/services/redis.service";
+import {
+  dataSessionKey,
+  eventJobId,
+  getSessionQueueRouter,
+  isSessionTask,
+  sessionQueueKey,
+} from "@/services/sessionQueue.service";
 
 // Bull Board 配置
 export const serverAdapter = new HonoAdapter(serveStatic);
@@ -14,10 +21,68 @@ export const serverAdapter = new HonoAdapter(serveStatic);
 // 优雅关闭的最长等待时间，超过后强制退出，避免卡住后被 Docker 直接 SIGKILL
 const SHUTDOWN_TIMEOUT = 10_000;
 
+// Old releases wrote directly to per-task queues. Those queues now only
+// forward into the lanes; they must never run a second copy of the processor.
+async function legacySessionKey(data: any): Promise<string> {
+  const directKey = dataSessionKey(data);
+  if (directKey) return directKey;
+
+  const callback = typeof data === "string" ? data.split("_") : [];
+  const groupId = data?.chat?.id ?? Number(callback[1]);
+  const topicId = data?.message_thread_id ?? Number(callback[2]);
+  if (!Number.isFinite(groupId) || !Number.isFinite(topicId)) {
+    throw new Error("Cannot route legacy task without a conversation");
+  }
+  const { getSessionByTopic } = await import("@/services/db.service");
+  const session = await getSessionByTopic(groupId, topicId);
+  return session
+    ? sessionQueueKey(session.website_id, session.session_id)
+    // A deleted conversation has no live lane; its existing handler returns
+    // "not found". Keeping a stable fallback still serializes stale callbacks.
+    : JSON.stringify(["deleted-telegram-topic", groupId, topicId]);
+}
+
+function observeQueue(queue: Queue) {
+  queue.on("error", (err) => {
+    logger.error("queue error", {
+      queue: queue.name,
+      code: (err as any)?.code,
+      message: err?.message,
+    });
+  });
+}
+
+function observeWorker(worker: Worker) {
+  worker.on("failed", (job, err) => {
+    logger.error("job failed", {
+      queue: worker.name,
+      jobId: job?.id,
+      name: job?.name,
+      attemptsMade: job?.attemptsMade,
+      code: (err as any)?.code,
+      message: err?.message,
+      stack: err?.stack,
+    });
+  });
+  worker.on("error", (err) => {
+    logger.error("worker error", {
+      queue: worker.name,
+      code: (err as any)?.code,
+      message: err?.message,
+      stack: err?.stack,
+    });
+  });
+  worker.on("stalled", (jobId) => {
+    logger.warn("job stalled", { queue: worker.name, jobId });
+  });
+}
+
 /**
  * 自动加载所有 worker 任务
  */
 export async function loadWorkers() {
+  const workers: Worker[] = [];
+  const queues: Queue[] = [];
   try {
     // 获取所有 .ts 文件
     const taskFiles = await glob("src/jobs/**/*.ts", {
@@ -25,88 +90,68 @@ export async function loadWorkers() {
       absolute: true,
     });
 
-    const workers: Worker[] = [];
-    const queues: Queue[] = [];
+    const router = await getSessionQueueRouter();
+    const tasks: JobItem[] = [];
 
     for (const taskFile of taskFiles) {
-      try {
-        // 动态导入任务文件
-        const taskModule = await import(taskFile);
-        const {
-          name,
-          queue,
-          schedule,
-          processor,
-          concurrency,
-          options,
-        }: JobItem = taskModule.default;
-
-        // 如果导出了队列，收集它
-        if (taskModule.default && name) {
-          // 创建队列
-          queues.push(queue);
-          // Redis 连接异常只记录日志
-          queue.on("error", (err) => {
-            logger.error("queue error", {
-              queue: queue.name,
-              code: (err as any)?.code,
-              message: err?.message,
-            });
-          });
-
-          // 如果有定时任务，创建 Cron 任务
-          if (schedule) {
-            // 不阻塞启动；失败（例如 Redis 暂时不可用）只记录日志，避免变成未处理的 Promise 拒绝
-            const scheduler: Promise<unknown> =
-              Bun.env.NODE_ENV !== "production"
-                ? queue.removeJobScheduler(name)
-                : queue.upsertJobScheduler(name, { pattern: schedule });
-            scheduler.catch((err) => {
-              logger.error("配置定时任务失败", {
-                queue: queue.name,
-                message: err?.message,
-              });
-            });
-          }
-
-          // 如果有处理器，创建 Worker
-          if (processor) {
-            const worker = new Worker(queue.name, processor, {
-              concurrency: concurrency || 10,
-              connection,
-              ...options,
-            });
-
-            worker.on("failed", (job, err) => {
-              logger.error("job failed", {
-                queue: queue.name,
-                jobId: job?.id,
-                name: job?.name,
-                attemptsMade: job?.attemptsMade,
-                data: job?.data,
-                code: (err as any)?.code,
-                message: err?.message,
-                stack: err?.stack,
-              });
-            });
-            worker.on("error", (err) => {
-              logger.error("worker error", {
-                queue: queue.name,
-                code: (err as any)?.code,
-                message: err?.message,
-                stack: err?.stack,
-              });
-            });
-            worker.on("stalled", (jobId) => {
-              logger.warn("job stalled", { queue: queue.name, jobId });
-            });
-
-            workers.push(worker);
-          }
+      const { default: task }: { default: JobItem } = await import(taskFile);
+      if (!task?.name) continue;
+      tasks.push(task);
+      queues.push(task.queue);
+      observeQueue(task.queue);
+      if (task.processor && isSessionTask(task.queue.name)) {
+        if (typeof task.processor !== "function") {
+          throw new Error(`Conversation task ${task.name} requires an inline processor`);
         }
-      } catch (error) {
-        logger.error(`加载任务文件失败 ${taskFile}:`, error);
+        router.register(task.queue.name, task.processor as Processor);
       }
+    }
+
+    const lanes = router.queues() as Queue[];
+    lanes.forEach(observeQueue);
+    queues.push(...lanes);
+    // This Redis-side limit is shared by every application replica.
+    await router.configure();
+
+    for (const { name, queue, schedule, processor, concurrency, options } of tasks) {
+      if (schedule) {
+        await (Bun.env.NODE_ENV !== "production"
+          ? queue.removeJobScheduler(name)
+          : queue.upsertJobScheduler(name, { pattern: schedule }));
+      }
+      if (!processor) continue;
+      const sessionTask = isSessionTask(queue.name);
+      const worker = new Worker(
+        queue.name,
+        sessionTask
+          ? async (job) => {
+              const sessionKey = await legacySessionKey(job.data);
+              const forwarded = await router.add(queue.name, job.name, job.data, {
+                sessionKey,
+                jobId: eventJobId("legacy", queue.name, job.id),
+              });
+              return { forwardedTo: forwarded.queueName, jobId: forwarded.id };
+            }
+          : processor,
+        {
+          ...options,
+          connection,
+          concurrency: sessionTask ? 1 : concurrency || 10,
+          autorun: false,
+        },
+      );
+      observeWorker(worker);
+      workers.push(worker);
+    }
+
+    for (const queue of lanes) {
+      const worker = new Worker(queue.name, (job, token) => router.dispatch(job, token), {
+        connection,
+        concurrency: 1,
+        autorun: false,
+      });
+      observeWorker(worker);
+      workers.push(worker);
     }
 
     // 创建 Bull Board
@@ -115,13 +160,21 @@ export async function loadWorkers() {
       serverAdapter,
     });
 
+    // Register every handler and global limit before consuming any persisted job.
+    for (const worker of workers) {
+      void worker.run().catch((error) => {
+        logger.error("Worker stopped unexpectedly", { queue: worker.name, message: error?.message });
+      });
+    }
     logger.info(`总共加载了 ${workers.length} 个 Workers`);
     logger.info("Bull Board 已配置完成");
 
     return { workers, queues };
   } catch (error) {
+    await Promise.allSettled(workers.map((worker) => worker.close(true)));
+    await Promise.allSettled(queues.map((queue) => queue.close()));
     logger.error("加载 Workers 失败:", error);
-    return { workers: [], queues: [] };
+    throw error;
   }
 }
 

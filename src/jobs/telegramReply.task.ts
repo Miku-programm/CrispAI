@@ -7,6 +7,7 @@ import path from "path";
 import { createResponse } from "@/utils/general";
 import axios from "axios";
 import { connection } from "@/services/redis.service";
+import { markHumanActivity } from "@/services/support.service";
 
 const currentFileName = path.basename(
   import.meta.url,
@@ -42,6 +43,11 @@ export default {
     if (!project) {
       return createResponse(false, "未找到项目");
     }
+    if (await db.isSessionBlocked(data.website_id, data.session_id)) {
+      return createResponse(true, "已屏蔽的会话");
+    }
+    // Also handles jobs accepted by the old version before ingress tracking existed.
+    if (!job.data.human_activity_recorded) await markHumanActivity(data.website_id, data.session_id);
     const msg = job.data.caption || job.data.text;
     // 发送文本内容到 Crisp
     if (msg) {
@@ -57,6 +63,8 @@ export default {
         project.botName,
         project.botIcon
       );
+      data.thread.push({ role: "assistant", content: msg });
+      await db.updateSession(data.session_id, { thread: data.thread });
       await crisp.composeMessage(
         data.website_id,
         "session_" + data.session_id,
@@ -77,19 +85,7 @@ export default {
       } catch {}
     }
 
-    // 如果开启智能回复，则关闭
-    if (data.enable_reply) {
-      await db.setSessionReplyByTopic(group_id, topic_id, false);
-      try {
-        await telegram.default.api.editMessageReplyMarkup(
-          group_id,
-          data.message_id,
-          {
-            reply_markup: telegram.changeAI(group_id, topic_id, false),
-          }
-        );
-      } catch {}
-    }
+    await telegram.refreshSessionControls(data);
     // 如果有图片，则发送图片到 Crisp
     if (job.data.photo) {
       await crisp.composeMessage(

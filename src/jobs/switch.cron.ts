@@ -38,17 +38,20 @@ export default {
         (p) => p.websiteId === session.website_id
       );
       if (project) {
+        // New support policies own their deadlines. The legacy timer must not silently re-enable them.
+        if (project.support.enabled || await db.isSessionBlocked(session.website_id, session.session_id)) continue;
         const enableTime =
           new Date(session.enable_time).getTime() + project.timer * 1000;
         if (enableTime < Date.now()) {
-          toEnableIds.push(session.session_id);
+          if (await db.enableSessionIfUnchanged(
+            session.session_id, new Date(session.enable_time), session.control_version ?? 0,
+          )) toEnableIds.push(session.session_id);
         }
       } else {
         toDeleteIds.push(session.session_id);
       }
     }
 
-    await db.enableSessions(toEnableIds);
     for (const id of toEnableIds) {
       const session = sessionData.find((s) => s.session_id === id);
       if (session && session.topic_id && session.group_id) {

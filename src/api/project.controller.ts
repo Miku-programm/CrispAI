@@ -2,6 +2,7 @@ import type { Context } from "hono";
 import z from "zod";
 import * as db from "@/services/db.service";
 import { validate } from "@/api/validator";
+import { supportConflictMessage } from "@/types/support";
 
 const triggerType = z.enum(["none", "text", "option", "closeAI"]);
 
@@ -100,6 +101,8 @@ export const saveAIController = async (c: Context) => {
 
   const project = await db.getProjectById(project_id);
   if (!project) return c.json({ message: "查询项目失败" }, 400);
+  const conflict = supportConflictMessage(project.support, enable);
+  if (conflict) return c.json({ message: conflict }, 400);
 
   await db.updateProject(project_id, {
     enableAI: enable,

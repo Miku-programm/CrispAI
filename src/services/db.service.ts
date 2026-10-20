@@ -1,6 +1,7 @@
 import { SQL } from "bun";
 import path from "path";
 import logger from "@/services/logger.service";
+import { parseSupportConfig, type SupportConfig } from "@/types/support";
 
 /**
  * Postgres 服务封装
@@ -45,6 +46,7 @@ const toNumber = (value: unknown) =>
 const toProject = (row: any) => {
   if (!row) return null;
   row.telegramId = toNumber(row.telegramId);
+  row.support = parseSupportConfig(row.support);
   return row;
 };
 
@@ -105,7 +107,26 @@ export const deleteProject = async (id: string) => {
       delete from project where id = ${id} returning "websiteId"`;
     if (row?.websiteId) {
       await tx`delete from session where website_id = ${row.websiteId}`;
+      await tx`delete from blocked_session where website_id = ${row.websiteId}`;
     }
+  });
+};
+
+/** 保存策略时使旧的超时任务失效，不覆盖人工接管标记。 */
+export const saveProjectSupport = async (id: string, support: SupportConfig) => {
+  return await sql.begin(async (tx) => {
+    const [row] = await tx`
+      update project set ${tx({ support })} where id = ${id} returning *`;
+    if (!row) return null;
+    if (row.websiteId) {
+      await tx`
+        update session set
+          pending_since = null, deadline_at = null, pending_token = null,
+          pending_message = null, fallback_active = false, fallback_action = null,
+          control_version = control_version + 1
+        where website_id = ${row.websiteId}`;
+    }
+    return toProject(row);
   });
 };
 
@@ -146,6 +167,29 @@ export const updateSession = async (
     where session_id = ${session_id} returning *`;
   return toSession(row);
 };
+/** 人工回复/策略切换改变 control_version 后，旧任务不能再写入接管状态。 */
+export const updateSessionIfVersion = async (
+  sessionId: string,
+  version: number,
+  patch: Record<string, unknown>,
+) => {
+  const data = clean(patch);
+  if (Object.keys(data).length === 0) {
+    const row = await getSession(sessionId);
+    return row?.control_version === version ? row : null;
+  }
+  const [row] = await sql`
+    update session set ${sql(data)}
+    where session_id = ${sessionId} and control_version = ${version}
+    returning *`;
+  return toSession(row);
+};
+export const listPendingSessions = async (): Promise<any[]> => {
+  const rows = await sql`
+    select * from session where deadline_at <= now() and pending_token is not null
+    order by deadline_at asc`;
+  return rows.map(toSession);
+};
 /**
  * 切换 AI 回复开关并刷新 enable_time。
  * 只在状态确实变化时更新，避免重复点击把恢复 AI 的倒计时重置
@@ -175,14 +219,137 @@ export const enableSessions = async (session_ids: string[]) => {
     update session set enable_reply = true, enable_time = now()
     where session_id in ${sql(session_ids)}`;
 };
+/** A legacy timer may only restore the exact state it observed before scanning. */
+export const enableSessionIfUnchanged = async (
+  sessionId: string,
+  expectedEnableTime: Date,
+  version: number,
+): Promise<boolean> => {
+  const [row] = await sql`
+    update session set enable_reply = true, enable_time = now()
+    where session_id = ${sessionId} and enable_reply = false
+      -- JavaScript Date retains milliseconds; PostgreSQL timestamps retain microseconds.
+      and date_trunc('milliseconds', enable_time) = ${expectedEnableTime}
+      and control_version = ${version}
+      and exists (
+        select 1 from project p
+        where p."websiteId" = session.website_id
+          and coalesce(p.support->>'enabled', 'false') <> 'true'
+      )
+      and not exists (
+        select 1 from blocked_session b
+        where b.website_id = session.website_id and b.session_id = session.session_id
+      )
+    returning session_id`;
+  return !!row;
+};
 export const deleteSessions = async (session_ids: string[]) => {
   if (session_ids.length === 0) return;
   await sql`delete from session where session_id in ${sql(session_ids)}`;
 };
 export const deleteSessionsBefore = async (before: Date) => {
   const rows = await sql`
-    delete from session where enable_time < ${before} returning session_id`;
+    delete from session
+    where pending_token is null
+      and greatest(enable_time, last_customer_at, last_human_at) < ${before}
+    returning session_id`;
+  await sql`delete from control_event where created_at < ${before}`;
   return rows.map((row: any) => row.session_id as string);
+};
+
+const normalizeSessionId = (sessionId: string) =>
+  sessionId.replace(/^session_/, "");
+
+/** 人工消息可能早于访客入队，先建立最小会话再原子使旧接管任务失效。 */
+export const markHumanActivity = async (
+  websiteId: string,
+  sessionId: string,
+  eventKey?: string,
+) => {
+  return sql.begin(async (tx) => {
+    if (eventKey) {
+      const [inserted] = await tx`
+        insert into control_event (event_key) values (${eventKey})
+        on conflict (event_key) do nothing returning event_key`;
+      if (!inserted) {
+        const [existing] = await tx`
+          select * from session
+          where website_id = ${websiteId} and session_id = ${normalizeSessionId(sessionId)}`;
+        return toSession(existing);
+      }
+    }
+    const [row] = await tx`
+      insert into session (website_id, session_id, enable_reply, last_human_at, control_version)
+      values (${websiteId}, ${normalizeSessionId(sessionId)}, false, now(), 1)
+      on conflict (session_id) do update set
+        enable_reply = false, enable_time = now(), last_human_at = now(),
+        pending_since = null, deadline_at = null, pending_token = null,
+        pending_message = null, fallback_active = false, fallback_action = null,
+        control_version = session.control_version + 1
+      where session.website_id = excluded.website_id
+      returning *`;
+    return toSession(row);
+  });
+};
+
+// ---------------------------------------------------------------------------
+// blocked_session（不随会话过期清理删除）
+// ---------------------------------------------------------------------------
+
+export const listBlockedSessions = async (websiteId: string): Promise<any[]> =>
+  await sql`
+    select website_id, session_id, reason, source, created_at
+    from blocked_session where website_id = ${websiteId}
+    order by created_at desc`;
+
+export const isSessionBlocked = async (
+  websiteId: string,
+  sessionId: string,
+): Promise<boolean> => {
+  const [row] = await sql`
+    select 1 from blocked_session
+    where website_id = ${websiteId} and session_id = ${normalizeSessionId(sessionId)}
+    limit 1`;
+  return !!row;
+};
+
+export const blockSession = async (
+  websiteId: string,
+  sessionId: string,
+  reason = "",
+  source: "manual" | "abuse" = "manual",
+) => {
+  const cleanId = normalizeSessionId(sessionId);
+  return await sql.begin(async (tx) => {
+    const [row] = await tx`
+      insert into blocked_session ${tx({
+        website_id: websiteId, session_id: cleanId, reason, source,
+      })}
+      on conflict (website_id, session_id) do update set
+        reason = excluded.reason, source = excluded.source
+      returning *`;
+    await tx`
+      update session set
+        pending_since = null, deadline_at = null, pending_token = null,
+        pending_message = null, fallback_active = false, fallback_action = null,
+        control_version = control_version + 1
+      where website_id = ${websiteId} and session_id = ${cleanId}`;
+    return row;
+  });
+};
+
+export const unblockSession = async (websiteId: string, sessionId: string) => {
+  const cleanId = normalizeSessionId(sessionId);
+  await sql.begin(async (tx) => {
+    await tx`
+      delete from blocked_session where website_id = ${websiteId} and session_id = ${cleanId}`;
+    await tx`
+      update session set
+        pending_since = null, deadline_at = null, pending_token = null,
+        pending_message = null, fallback_active = false, fallback_action = null,
+        control_version = control_version + 1
+      where website_id = ${websiteId} and session_id = ${cleanId}`;
+  });
 };
 
 // ---------------------------------------------------------------------------

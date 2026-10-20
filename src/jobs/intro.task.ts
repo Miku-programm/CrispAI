@@ -30,6 +30,9 @@ export default {
     const { website_id, session_id } = job.data;
     const project = await db.getProject(website_id);
     if (!project) return createResponse(false, "未找到项目");
+    if (await db.isSessionBlocked(website_id, session_id)) return createResponse(true, "已屏蔽的会话");
+    // New policy sends its offline/timeout notice on an actual customer inquiry.
+    if (project.support.enabled) return createResponse(true, "客服策略已接管欢迎语");
 
     const data = await crisp.getMessages(website_id, session_id);
     if (data.length > 0) {

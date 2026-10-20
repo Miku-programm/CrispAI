@@ -4,6 +4,7 @@ import * as db from "@/services/db.service";
 import { createEmbedding, EMBEDDING_MODEL } from "@/services/openai.service";
 import logger from "@/services/logger.service";
 import { validate } from "@/api/validator";
+import { supportSchema, supportConflictMessage } from "@/types/support";
 
 /**
  * 项目导入导出
@@ -34,6 +35,7 @@ const PROJECT_FIELDS = [
   "payload",
   "options",
   "timer",
+  "support",
 ] as const;
 
 export const exportSchema = validate(
@@ -98,6 +100,7 @@ const importBody = z.object({
     payload: z.string().nullish(),
     options: trigger.partial().optional(),
     timer: z.number().int().positive().optional(),
+    support: supportSchema.optional(),
   }),
   options: z
     .array(
@@ -144,6 +147,10 @@ const normalizeVector = (vector: string | number[] | null | undefined) => {
 
 export const importController = async (c: Context) => {
   const body = importBody.parse(await c.req.json());
+  if (body.project.support) {
+    const conflict = supportConflictMessage(body.project.support, !!body.project.enableAI);
+    if (conflict) return c.json({ message: conflict }, 400);
+  }
   const warnings: string[] = [];
 
   // 选项 id 一律换新：同一份文件可以重复导入，也不会和已有选项撞 id。

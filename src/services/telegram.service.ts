@@ -5,13 +5,17 @@ import telegramCallbackTask from "@/jobs/telegramCallback.task";
 import telegramReplyTask from "@/jobs/telegramReply.task";
 import logger from "@/services/logger.service";
 import { enqueue } from "@/utils/queue";
+import * as db from "@/services/db.service";
+import { eventJobId, sessionQueueKey } from "@/services/sessionQueue.service";
+import { markHumanActivity, unblockCustomer } from "@/services/support.service";
+import { isSupportOnline } from "@/services/support.policy";
+import { supportConflictMessage } from "@/types/support";
 
 const TOKEN = Bun.env.TELEGRAM_TOKEN || "";
 const bot = new Bot(TOKEN);
 bot.api.config.use(autoRetry());
 
-// 处理更新出错时只记录日志并正常返回 200。
-// grammY 默认会把错误重新抛出，Webhook 返回 500 后 Telegram 会不断重发同一条更新
+// 记录错误并继续抛出，入队失败必须让 Webhook 返回非成功状态，允许 Telegram 重投。
 bot.catch((err) => {
   const error = err.error;
   logger.error("Telegram 更新处理失败", {
@@ -19,6 +23,7 @@ bot.catch((err) => {
     message: error instanceof Error ? error.message : String(error),
     stack: error instanceof Error ? error.stack : undefined,
   });
+  throw error;
 });
 
 bot.command("start", (ctx) => ctx.reply("请输入 /ping 获取群组 ID"));
@@ -46,8 +51,23 @@ bot.command("ping", async (ctx) => {
   }
 });
 bot.on("callback_query:data", async (ctx) => {
-  // 先入队再应答：应答失败（例如按钮点击已过期）不影响任务执行
-  enqueue(telegramCallbackTask.queue, "telegramCallback", ctx.callbackQuery.data);
+  const match = /^(open|close|block|unblock)_(-?\d+)_(\d+)$/.exec(ctx.callbackQuery.data);
+  if (!match || !ctx.callbackQuery.message) {
+    await ctx.answerCallbackQuery({ text: "无效的操作" });
+    return;
+  }
+  const groupId = Number(match[2]), topicId = Number(match[3]);
+  const session = await db.getSessionByTopic(groupId, topicId);
+  if (!session || ctx.callbackQuery.message.chat.id !== groupId
+    || ctx.callbackQuery.message.message_id !== session.message_id) {
+    await ctx.answerCallbackQuery({ text: "会话不存在或按钮已过期" });
+    return;
+  }
+  // Apply control immediately, so a completion already running in the lane cannot send after takeover.
+  await applySessionControl(session, match[1]!);
+  await enqueue(telegramCallbackTask.queue, "telegramCallback", {
+    website_id: session.website_id, session_id: session.session_id,
+  }, { jobId: eventJobId("telegram-control", ctx.update.update_id) });
   try {
     await ctx.answerCallbackQuery();
   } catch (error) {
@@ -56,28 +76,106 @@ bot.on("callback_query:data", async (ctx) => {
     });
   }
 });
-bot.on("msg:text", async (ctx) => {
-  if (!ctx.message?.is_topic_message) return;
-  enqueue(telegramReplyTask.queue, "telegramReply", ctx.message);
-});
-bot.on("msg:photo", async (ctx) => {
-  if (!ctx.message?.is_topic_message) return;
-  enqueue(telegramReplyTask.queue, "telegramReply", ctx.message);
-});
-bot.on("msg:sticker", async (ctx) => {
-  if (!ctx.message?.is_topic_message) return;
-  enqueue(telegramReplyTask.queue, "telegramReply", ctx.message);
+for (const command of ["online", "offline", "auto", "status"] as const) {
+  bot.command(command, async (ctx) => {
+    const projects = (await db.listProjects()).filter(p => p.telegramId === ctx.chat.id);
+    const wanted = ctx.match.trim();
+    const chosen = wanted ? projects.filter(p => p.id === wanted) : projects;
+    if (!chosen.length) return ctx.reply("此群尚未绑定该项目，请在管理后台配置 Telegram 群组 ID。");
+    if (command === "status") {
+      return ctx.reply(chosen.map(p => `${p.name} (${p.id})\n策略：${p.support.enabled ? "已启用" : "旧版自动回复"}；当前${isSupportOnline(p.support) ? "在线" : "离线"}；${p.support.availabilityMode === "schedule" ? "按营业时间" : "手动模式"}`).join("\n\n"));
+    }
+    if (chosen.length !== 1) return ctx.reply(`此群绑定了多个项目，请使用 /${command} 项目ID：\n${chosen.map(p => `${p.name}: ${p.id}`).join("\n")}`);
+    const project = chosen[0]!;
+    const config = { ...project.support, enabled: true,
+      availabilityMode: command === "auto" ? "schedule" as const : "manual" as const,
+      online: command === "auto" ? project.support.online : command === "online" };
+    const conflict = supportConflictMessage(config, project.enableAI);
+    if (conflict) return ctx.reply(conflict);
+    await db.saveProjectSupport(project.id, config);
+    return ctx.reply(`${project.name}：已切换为${command === "auto" ? "营业时间自动模式" : command === "online" ? "手动在线" : "手动离线"}。`);
+  });
+}
+
+for (const command of ["block", "unblock"] as const) {
+  bot.command(command, async ctx => {
+    if (!ctx.message?.message_thread_id) return ctx.reply("请在客户对应的话题内使用此命令。");
+    const session = await db.getSessionByTopic(ctx.chat.id, ctx.message.message_thread_id);
+    if (!session) return ctx.reply("未找到此话题对应的客户会话。");
+    await applySessionControl(session, command);
+    await refreshSessionControls(session);
+    return ctx.reply(command === "block" ? "已屏蔽此会话，不再转发或自动回复。" : "已解除屏蔽，新消息将恢复处理。", {
+      message_thread_id: session.topic_id,
+    });
+  });
+}
+
+bot.on(["msg:text", "msg:photo", "msg:sticker"], async ctx => {
+  if (!ctx.message?.is_topic_message || !ctx.message.message_thread_id) return;
+  const session = await db.getSessionByTopic(ctx.chat.id, ctx.message.message_thread_id);
+  if (!session || await db.isSessionBlocked(session.website_id, session.session_id)) return;
+  await markHumanActivity(session.website_id, session.session_id, eventJobId("telegram-human", ctx.update.update_id));
+  await enqueue(telegramReplyTask.queue, "telegramReply", { ...ctx.message, human_activity_recorded: true }, {
+    sessionKey: sessionQueueKey(session.website_id, session.session_id),
+    jobId: eventJobId("telegram-reply", ctx.update.update_id),
+  });
 });
 
-export const changeAI = (groupId: number, topicId: number, bool: boolean) => {
+export const changeAI = (groupId: number, topicId: number, bool: boolean, blocked = false) => {
   const text = bool ? "暂时关闭 AI 回复" : "开启 AI 回复";
   const callback_data = bool
     ? `close_${groupId}_${topicId}`
     : `open_${groupId}_${topicId}`;
   return {
-    inline_keyboard: [[{ text, callback_data }]],
+    inline_keyboard: [
+      ...(blocked ? [] : [[{ text, callback_data }]]),
+      [{ text: blocked ? "解除屏蔽" : "屏蔽此客户", callback_data: `${blocked ? "unblock" : "block"}_${groupId}_${topicId}` }],
+    ],
   };
 };
+
+export const escapeHTML = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+export async function applySessionControl(session: Session, action: string) {
+  if (action === "block") return db.blockSession(session.website_id, session.session_id, "客服手动屏蔽", "manual");
+  if (action === "unblock") return unblockCustomer(session.website_id, session.session_id);
+  if (action === "close") return markHumanActivity(session.website_id, session.session_id);
+  if (action === "open") {
+    const project = await db.getProject(session.website_id);
+    if (!project?.enableAI || await db.isSessionBlocked(session.website_id, session.session_id)) return;
+    return db.updateSessionIfVersion(session.session_id, session.control_version ?? 0, {
+      enable_reply: true, enable_time: new Date(), control_version: (session.control_version ?? 0) + 1,
+      pending_token: null, pending_since: null, pending_message: null, deadline_at: null,
+      fallback_active: true, fallback_action: "ai",
+    });
+  }
+}
+
+export async function refreshSessionControls(session: Session) {
+  const current = await db.getSession(session.session_id);
+  if (!current?.group_id || !current.message_id || !current.topic_id) return;
+  const blocked = await db.isSessionBlocked(current.website_id, current.session_id);
+  const project = await db.getProject(current.website_id);
+  const automatic = project?.support.enabled
+    ? !!current.fallback_active && ["ai", "rules"].includes(current.fallback_action ?? "")
+    : current.enable_reply;
+  try {
+    await bot.api.editMessageReplyMarkup(current.group_id, current.message_id, {
+      reply_markup: changeAI(current.group_id, current.topic_id, automatic, blocked),
+    });
+  } catch (error) { logger.warn("更新会话按钮失败", { message: String(error) }); }
+}
+
+export async function notifyBlocked(websiteId: string, sessionId: string) {
+  const session = await db.getSession(sessionId);
+  if (!session?.group_id || !session.topic_id) return;
+  await refreshSessionControls(session);
+  try {
+    await bot.api.sendMessage(session.group_id, "🛑 此会话触发刷屏规则，已停止转发和自动回复。可点击「解除屏蔽」恢复。", {
+      message_thread_id: session.topic_id,
+    });
+  } catch (error) { logger.warn("发送屏蔽提示失败", { websiteId, message: String(error) }); }
+}
 
 // 注册 Webhook 失败后的重试间隔
 const WEBHOOK_RETRY_DELAY = 30_000;
@@ -111,7 +209,7 @@ export const setupWebhook = async () => {
     try {
       await bot.api.setWebhook(
         endpoint,
-        { drop_pending_updates: true, secret_token: WEBHOOK_SECRET },
+        { drop_pending_updates: false, secret_token: WEBHOOK_SECRET },
         // grammY 的类型声明用的是 abort-controller 包里的 AbortSignal，
         // 与运行时的标准 AbortSignal 只是类型不兼容，实际可以直接使用
         AbortSignal.timeout(WEBHOOK_TIMEOUT) as any
