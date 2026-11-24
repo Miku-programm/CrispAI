@@ -92,6 +92,7 @@ mock.module(source("services/openai.service.ts"), () => ({
 }));
 mock.module(source("services/crisp.service.ts"), () => ({
   getMetas: async () => [],
+  getMetaData: async () => ({}),
   listPages: async () => [],
   composeMessage: async () => true,
   sendMessage: async (_site: string, _session: string, text: string) => {

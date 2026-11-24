@@ -134,7 +134,8 @@ export const changeAI = (groupId: number, topicId: number, bool: boolean, blocke
   };
 };
 
-export const escapeHTML = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+// 实现放在 utils/html，这里保留导出给现有调用方
+export { escapeHTML } from "@/utils/html";
 
 export async function applySessionControl(session: Session, action: string) {
   if (action === "block") return db.blockSession(session.website_id, session.session_id, "客服手动屏蔽", "manual");

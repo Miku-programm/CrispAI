@@ -1,6 +1,8 @@
 import * as db from "@/services/db.service";
 import * as telegram from "@/services/telegram.service";
 import * as crisp from "@/services/crisp.service";
+import logger from "@/services/logger.service";
+import { clip, unescapeHTML } from "@/utils/html";
 
 export const createTelegramSession = async (
   session_id: string,
@@ -30,56 +32,72 @@ export const createTelegramSession = async (
 
   // 创建 Telegram 话题和消息
   const flow = await generateTelegramSession(session_id, website_id);
+  let topicId: number | undefined;
   try {
     const topic = await telegram.default.api.createForumTopic(
       project.telegramId,
       generateTelegramName(session_id, flow)
     );
-
-    const message = await telegram.default.api.sendMessage(
+    topicId = topic.message_thread_id;
+    const reply_markup = telegram.changeAI(
       project.telegramId,
-      flow.length > 0 ? flow.join("\n") : "无额外信息",
-      {
-        message_thread_id: topic.message_thread_id,
-        parse_mode: "HTML",
-        reply_markup: telegram.changeAI(
-          project.telegramId,
-          topic.message_thread_id,
-          initial.enable_reply
-        ),
-      }
+      topicId,
+      initial.enable_reply
     );
+
+    let message;
+    try {
+      message = await telegram.default.api.sendMessage(
+        project.telegramId,
+        flow.join("\n").trim() || "无额外信息",
+        { message_thread_id: topicId, parse_mode: "HTML", reply_markup }
+      );
+    } catch (err) {
+      // 资料消息发不出去（内容异常、超长等）时退回纯文本，保证话题一定能绑定到会话：
+      // 否则话题建了却没存下来，之后每条消息都会再建一个空话题，客服看不到任何内容
+      logger.warn("发送访客资料失败，改用纯文本", { message: String(err) });
+      message = await telegram.default.api.sendMessage(
+        project.telegramId,
+        "访客资料暂时无法显示",
+        { message_thread_id: topicId, reply_markup }
+      );
+    }
 
     // 更新数据库里的 session，加上 group/topic/message 信息
     const update = {
       group_id: project.telegramId,
-      topic_id: topic.message_thread_id,
+      topic_id: topicId,
       message_id: message.message_id,
     };
 
     return await db.updateSession(session_id, update);
   } catch (err) {
-    console.error("创建 Telegram topic 或发送消息失败", err);
+    logger.error("创建 Telegram topic 或发送消息失败", { message: String(err) });
+    // 话题已建但没能绑定时删掉它，避免在群里留下一串空话题
+    if (topicId !== undefined) {
+      try {
+        await telegram.default.api.deleteForumTopic(project.telegramId, topicId);
+      } catch {}
+    }
     // 如果失败，返回最少的 initial session，不至于中断
     return initial;
   }
 };
-const generateTelegramName = (session_id: string, flow: string[]) => {
+// Telegram 话题名上限 128 字符
+const TOPIC_NAME_MAX = 120;
+export const generateTelegramName = (session_id: string, flow: string[]) => {
   let nickname = session_id;
   for (let i = 0; i < flow.length; i++) {
     const line = flow[i];
     if (!line) continue;
-    if (line.startsWith("👤")) {
+    if (line.startsWith("👤") || line.startsWith("📧")) {
       const nicknameMatch = line.match(/<code>(.*?)<\/code>/);
-      if (nicknameMatch) nickname = nicknameMatch[1]!;
-      break;
-    } else if (line.startsWith("📧")) {
-      const nicknameMatch = line.match(/<code>(.*?)<\/code>/);
-      if (nicknameMatch) nickname = nicknameMatch[1]!;
+      // flow 里是转义过的 HTML，话题名是纯文本，要还原
+      if (nicknameMatch) nickname = unescapeHTML(nicknameMatch[1]!);
       break;
     }
   }
-  return nickname;
+  return clip(nickname.trim() || session_id, TOPIC_NAME_MAX);
 };
 
 interface CacheItem {

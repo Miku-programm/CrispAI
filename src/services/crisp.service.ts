@@ -8,6 +8,7 @@ import messageUpdatedTask from "@/jobs/messageUpdated.task";
 import { enqueue } from "@/utils/queue";
 import { eventJobId } from "@/services/sessionQueue.service";
 import { checkAbuse, markHumanActivity } from "@/services/support.service";
+import { clip, escapeHTML, safeLink } from "@/utils/html";
 
 const crisp = axios.create({
   baseURL: "https://api.crisp.chat/v1",
@@ -115,44 +116,55 @@ export const crispWebhook = async (c: Context) => {
   return c.json({ ok: true });
 };
 
-export const getMetas = async (website_id: string, session_id: string) => {
-  try {
-    const {
-      data: { data },
-    } = await crisp.get(
-      `/website/${website_id}/conversation/${session_id}/meta`
-    );
-    const flow = [];
-    if (data.nickname)
-      flow.push(`👤<b>用户</b>：<code>${data.nickname}</code>`);
-    if (data.email) flow.push(`📧<b>邮箱</b>：<code>${data.email}</code>`);
-    if (data.device) {
-      if (data.device.geolocation && data.device.geolocation.country) {
-        flow.push("");
-        flow.push(
-          `📍<b>地理位置</b>：${data.device.geolocation.country} ${data.device.geolocation.city}`
-        );
-      }
-      const system = data.device.system;
-      if (system && system.os && system.os.name) {
-        flow.push("");
-        flow.push(`🖥<b>操作系统</b>：${system.os.name}`);
-      }
-      if (system && system.browser && system.browser.name) {
-        flow.push("");
-        flow.push(`🌐<b>浏览器</b>：${system.browser.name}`);
-      }
-      if (data.data) {
-        flow.push("");
-        flow.push("📄<b>附加信息</b>：");
-        flow.push("<pre>" + JSON.stringify(data.data) + "</pre>");
-      }
-    }
-    return flow;
-  } catch (error) {
-    throw error;
-  }
+/** 访客资料的原始数据（未转义）。给 AI 用的资料从这里取，不要用 getMetas 的 HTML 文本 */
+export const getMetaData = async (website_id: string, session_id: string) => {
+  const {
+    data: { data },
+  } = await crisp.get(`/website/${website_id}/conversation/${session_id}/meta`);
+  return data ?? {};
 };
+
+/**
+ * 访客资料，格式化成 Telegram HTML。
+ * 所有字段都是访客可控的，逐个转义并限长：没转义时昵称里一个 "<" 就会让 Telegram 拒收整条消息
+ */
+export const getMetas = async (website_id: string, session_id: string) => {
+  const data = await getMetaData(website_id, session_id);
+  const text = (value: unknown, max: number) => escapeHTML(clip(value, max));
+  const flow = [];
+  if (data.nickname)
+    flow.push(`👤<b>用户</b>：<code>${text(data.nickname, 100)}</code>`);
+  if (data.email)
+    flow.push(`📧<b>邮箱</b>：<code>${text(data.email, 200)}</code>`);
+  if (data.device) {
+    if (data.device.geolocation && data.device.geolocation.country) {
+      flow.push("");
+      flow.push(
+        `📍<b>地理位置</b>：${text(data.device.geolocation.country, 60)} ${text(
+          data.device.geolocation.city ?? "",
+          60,
+        )}`,
+      );
+    }
+    const system = data.device.system;
+    if (system && system.os && system.os.name) {
+      flow.push("");
+      flow.push(`🖥<b>操作系统</b>：${text(system.os.name, 60)}`);
+    }
+    if (system && system.browser && system.browser.name) {
+      flow.push("");
+      flow.push(`🌐<b>浏览器</b>：${text(system.browser.name, 60)}`);
+    }
+    if (data.data && Object.keys(data.data).length > 0) {
+      flow.push("");
+      flow.push("📄<b>附加信息</b>：");
+      flow.push("<pre>" + text(JSON.stringify(data.data), 800) + "</pre>");
+    }
+  }
+  return flow;
+};
+// Telegram 单条消息上限 4096 字符，访问历史只取最近几条并限制每条长度
+const MAX_PAGES = 8;
 export const listPages = async (website_id: string, session_id: string) => {
   try {
     const {
@@ -161,22 +173,22 @@ export const listPages = async (website_id: string, session_id: string) => {
       `/website/${website_id}/conversation/${session_id}/pages/1`
     );
     const flow = [];
-    if (data && data.length > 0) {
+    const pages = Array.isArray(data) ? data.slice(0, MAX_PAGES) : [];
+    if (pages.length > 0) {
       flow.push("");
       flow.push("📄<b>访问历史</b>：");
-      for (let i = 0; i < data.length; i++) {
-        const page = data[i];
+      for (let i = 0; i < pages.length; i++) {
+        const page = pages[i];
         flow.push(
-          `${i === 0 ? "<blockquote expandable>" : ""}<a href="${
-            page.page_url
-          }">${page.page_url}</a>`
+          `${i === 0 ? "<blockquote expandable>" : ""}${safeLink(
+            page.page_url,
+            120,
+          )}`
         );
         if (page.page_referrer) {
-          flow.push(
-            `来源：<a href="${page.page_referrer}">${page.page_referrer}</a>`
-          );
+          flow.push(`来源：${safeLink(page.page_referrer, 120)}`);
         }
-        if (i === data.length - 1) flow.push("</blockquote>");
+        if (i === pages.length - 1) flow.push("</blockquote>");
       }
     }
     return flow;
