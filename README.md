@@ -20,8 +20,29 @@ cp .env.example .env     # 按文件里的注释填写
 docker compose up -d
 ```
 
-然后用反向代理（Caddy / Nginx / Traefik 等）把域名指到 `127.0.0.1:3000`，打开
+然后用反向代理（Caddy / Nginx / Traefik 等）把域名指到 `127.0.0.1:3000`（见下面「反向代理」），打开
 `https://你的域名/`，用 `ADMIN_USER` / `ADMIN_PASSWORD` 登录。数据库表在首次启动时自动创建。
+
+### 反向代理
+
+服务默认只监听 `127.0.0.1:3000`，必须经反向代理对外提供 https。
+
+后台登录有失败次数限制。想让它按访问者的真实 IP 分别计数，需要在 `.env` 里设 `TRUST_PROXY=true`，
+并确保反向代理会**追加或覆盖** `X-Forwarded-For`（否则这个头可以被伪造，限制形同虚设）：
+
+- Caddy、Traefik：默认就会处理，不用额外配置
+- Nginx：默认原样转发客户端自己带的头，必须加上这一行
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+不设 `TRUST_PROXY` 也能用：这时所有访问者共用一个较宽松的失败计数。
 
 ### 准备 Crisp 插件
 

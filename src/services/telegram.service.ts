@@ -1,4 +1,4 @@
-import { Bot } from "grammy";
+import { Bot, type Context } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 import type { ChatMemberAdministrator } from "grammy/types";
 import telegramCallbackTask from "@/jobs/telegramCallback.task";
@@ -56,6 +56,10 @@ bot.on("callback_query:data", async (ctx) => {
     await ctx.answerCallbackQuery({ text: "无效的操作" });
     return;
   }
+  if (!(await isOperator(ctx))) {
+    await ctx.answerCallbackQuery({ text: "只有群管理员可以操作" });
+    return;
+  }
   const groupId = Number(match[2]), topicId = Number(match[3]);
   const session = await db.getSessionByTopic(groupId, topicId);
   if (!session || ctx.callbackQuery.message.chat.id !== groupId
@@ -85,6 +89,7 @@ for (const command of ["online", "offline", "auto", "status"] as const) {
     if (command === "status") {
       return ctx.reply(chosen.map(p => `${p.name} (${p.id})\n策略：${p.support.enabled ? "已启用" : "旧版自动回复"}；当前${isSupportOnline(p.support) ? "在线" : "离线"}；${p.support.availabilityMode === "schedule" ? "按营业时间" : "手动模式"}`).join("\n\n"));
     }
+    if (!(await isOperator(ctx))) return ctx.reply("只有群管理员可以使用此命令。");
     if (chosen.length !== 1) return ctx.reply(`此群绑定了多个项目，请使用 /${command} 项目ID：\n${chosen.map(p => `${p.name}: ${p.id}`).join("\n")}`);
     const project = chosen[0]!;
     const config = { ...project.support, enabled: true,
@@ -100,6 +105,7 @@ for (const command of ["online", "offline", "auto", "status"] as const) {
 for (const command of ["block", "unblock"] as const) {
   bot.command(command, async ctx => {
     if (!ctx.message?.message_thread_id) return ctx.reply("请在客户对应的话题内使用此命令。");
+    if (!(await isOperator(ctx))) return ctx.reply("只有群管理员可以使用此命令。");
     const session = await db.getSessionByTopic(ctx.chat.id, ctx.message.message_thread_id);
     if (!session) return ctx.reply("未找到此话题对应的客户会话。");
     await applySessionControl(session, command);
@@ -112,14 +118,82 @@ for (const command of ["block", "unblock"] as const) {
 
 bot.on(["msg:text", "msg:photo", "msg:sticker"], async ctx => {
   if (!ctx.message?.is_topic_message || !ctx.message.message_thread_id) return;
-  const session = await db.getSessionByTopic(ctx.chat.id, ctx.message.message_thread_id);
-  if (!session || await db.isSessionBlocked(session.website_id, session.session_id)) return;
+  // 开启 TELEGRAM_ADMIN_ONLY 后，非管理员在话题里说的话不会发给客户
+  if (!(await isOperator(ctx))) return;
+  const topicId = ctx.message.message_thread_id;
+  const session = await db.getSessionByTopic(ctx.chat.id, topicId);
+  if (!session) {
+    // 会话 30 天无活动会被清理，但话题还开着。只在绑定了项目的群里提醒，每个话题每天最多一次
+    const bound = (await db.listProjects()).some(p => p.telegramId === ctx.chat.id);
+    if (bound && await noticeOnce(`expired:${ctx.chat.id}:${topicId}`)) {
+      await replyQuietly(ctx, "⚠️ 此话题对应的客户会话已过期，这条消息没有发送给客户。客户再次来信时会开启新的话题。");
+    }
+    return;
+  }
+  if (await db.isSessionBlocked(session.website_id, session.session_id)) {
+    if (await noticeOnce(`blocked:${ctx.chat.id}:${topicId}`)) {
+      await replyQuietly(ctx, "⚠️ 此会话已被屏蔽，这条消息没有发送给客户。发送 /unblock 可解除屏蔽。");
+    }
+    return;
+  }
   await markHumanActivity(session.website_id, session.session_id, eventJobId("telegram-human", ctx.update.update_id));
   await enqueue(telegramReplyTask.queue, "telegramReply", { ...ctx.message, human_activity_recorded: true }, {
     sessionKey: sessionQueueKey(session.website_id, session.session_id),
     jobId: eventJobId("telegram-reply", ctx.update.update_id),
   });
 });
+
+/**
+ * 可选的权限收紧：TELEGRAM_ADMIN_ONLY=true 时，只有群主/管理员能切换在线状态、屏蔽、
+ * 点按钮和回复客户。默认关闭，群里所有成员都算客服（原有行为）。
+ */
+const adminOnly = () => /^(1|true|yes|on)$/i.test(Bun.env.TELEGRAM_ADMIN_ONLY ?? "");
+const ADMIN_CACHE_MS = 5 * 60 * 1000;
+const adminCache = new Map<number, { ids: Set<number>; expires: number }>();
+
+async function isOperator(ctx: Context): Promise<boolean> {
+  if (!adminOnly()) return true;
+  const chat = ctx.chat;
+  if (!chat) return false;
+  // 匿名管理员发言时 from 是占位账号，sender_chat 就是本群
+  if (ctx.senderChat?.id === chat.id) return true;
+  const userId = ctx.from?.id;
+  if (!userId) return false;
+  let cached = adminCache.get(chat.id);
+  if (!cached || cached.expires <= Date.now()) {
+    try {
+      const admins = await ctx.api.getChatAdministrators(chat.id);
+      cached = { ids: new Set(admins.map(a => a.user.id)), expires: Date.now() + ADMIN_CACHE_MS };
+      adminCache.set(chat.id, cached);
+    } catch (error) {
+      // 查不到管理员名单时宁可拒绝，也不放行
+      logger.warn("获取群管理员失败", { message: String(error) });
+      return false;
+    }
+  }
+  return cached.ids.has(userId);
+}
+
+/** 同一个提醒 24 小时内只发一次。Redis 不可用时不提醒，不影响主流程 */
+async function noticeOnce(key: string): Promise<boolean> {
+  try {
+    const { connection } = await import("@/services/redis.service");
+    return !!(await connection.set(`crispai:notice:${key}`, "1", "EX", 86400, "NX"));
+  } catch {
+    return false;
+  }
+}
+
+async function replyQuietly(ctx: Context, text: string) {
+  try {
+    await ctx.reply(text, {
+      message_thread_id: ctx.message?.message_thread_id,
+      reply_parameters: ctx.message
+        ? { message_id: ctx.message.message_id, allow_sending_without_reply: true }
+        : undefined,
+    });
+  } catch (error) { logger.warn("发送提醒失败", { message: String(error) }); }
+}
 
 export const changeAI = (groupId: number, topicId: number, bool: boolean, blocked = false) => {
   const text = bool ? "暂时关闭 AI 回复" : "开启 AI 回复";

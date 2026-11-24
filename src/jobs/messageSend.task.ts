@@ -22,6 +22,7 @@ import type { SupportAction } from "@/types/support";
 import logger from "@/services/logger.service";
 import { clip } from "@/utils/html";
 import { trimThread } from "@/utils/thread";
+import { matchKeyword } from "@/utils/keyword";
 import { allowAICall } from "@/services/aiBudget.service";
 import {
   isAllowedMediaUrl,
@@ -273,10 +274,7 @@ const isJSON = (data: string) => {
   }
 };
 
-const getKeyword = (input: string, keywords: any[]) => {
-  if (!keywords?.length) return;
-  return keywords.find((k) => k && new RegExp(k.keyword).test(input));
-};
+const getKeyword = (input: string, keywords: any[]) => matchKeyword(input, keywords);
 
 const formatDate = () => {
   const date = new Date(Date.now() + 8 * 60 * 60 * 1000);

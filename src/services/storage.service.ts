@@ -1,5 +1,5 @@
 import path from "path";
-import { mkdir } from "fs/promises";
+import { mkdir, readdir, stat, unlink } from "fs/promises";
 
 /**
  * 本地文件存储
@@ -33,4 +33,42 @@ export const saveFile = async (name: string, data: Uint8Array) => {
 export const getFile = async (name: string) => {
   const file = Bun.file(path.join(UPLOAD_DIR, safeName(name)));
   return (await file.exists()) ? file : null;
+};
+
+/**
+ * 上传文件保留天数。默认 0 = 永不清理：这些图片的地址永久留在 Crisp 的聊天记录里，
+ * 删掉后历史消息里的图就打不开了，所以必须由部署者自己决定是否开启
+ */
+export const uploadRetentionDays = (raw = Bun.env.UPLOAD_RETENTION_DAYS) => {
+  if (raw === undefined || raw === "") return 0;
+  const value = Number(raw);
+  return Number.isInteger(value) && value >= 0 ? value : 0;
+};
+
+/**
+ * 删除上传目录里超过指定时长没改动过的文件，返回删除数量。
+ * 只处理目录下的普通文件，不进子目录、不跟随符号链接
+ */
+export const deleteFilesOlderThan = async (
+  maxAgeMs: number,
+  dir = UPLOAD_DIR,
+  now = Date.now(),
+) => {
+  let names: string[];
+  try {
+    names = await readdir(dir);
+  } catch {
+    return 0;
+  }
+  let deleted = 0;
+  for (const name of names) {
+    const file = path.join(dir, name);
+    try {
+      const info = await stat(file);
+      if (!info.isFile() || now - info.mtimeMs <= maxAgeMs) continue;
+      await unlink(file);
+      deleted++;
+    } catch {}
+  }
+  return deleted;
 };

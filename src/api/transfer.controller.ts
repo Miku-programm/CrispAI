@@ -5,6 +5,7 @@ import { createEmbedding, EMBEDDING_MODEL } from "@/services/openai.service";
 import logger from "@/services/logger.service";
 import { validate } from "@/api/validator";
 import { supportSchema, supportConflictMessage } from "@/types/support";
+import { isValidKeyword } from "@/utils/keyword";
 
 /**
  * 项目导入导出
@@ -150,6 +151,11 @@ export const importController = async (c: Context) => {
   if (body.project.support) {
     const conflict = supportConflictMessage(body.project.support, !!body.project.enableAI);
     if (conflict) return c.json({ message: conflict }, 400);
+  }
+  // 关键词在 worker 里当正则用，和后台保存时一样先校验
+  const badKeyword = (body.project.keyword ?? []).find((k) => !isValidKeyword(k.keyword));
+  if (badKeyword) {
+    return c.json({ message: `关键词不是合法的正则：${badKeyword.keyword}` }, 400);
   }
   const warnings: string[] = [];
 
