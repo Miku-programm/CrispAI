@@ -73,6 +73,40 @@ Webhook 由服务启动时自动注册到 `PUBLIC_URL/telegram`，并带 secret 
 <script type="text/javascript" src="https://你的域名/intro.js"></script>
 ```
 
+### 给 AI 助手用的 MCP 接口（可选）
+
+在 `.env` 里设置 `MCP_TOKEN`（至少 24 个字符的随机串）并重启后，`https://你的域名/mcp` 就是一个
+MCP 服务（Streamable HTTP），Hermes 等支持 MCP 的助手可以用它批量查看会话、批量回复客户。
+
+| 工具 | 功能 |
+|---|---|
+| `list_projects` | 列出项目 |
+| `list_sessions` | 按状态列出会话：等待人工、无人回复、已屏蔽、全部 |
+| `get_sessions` | 一次查看最多 20 个会话的最近消息和访客资料 |
+| `reply_sessions` | 一次给最多 20 个会话各回一条消息，每条分别返回是否送达 |
+
+Hermes 的 `~/.hermes/config.yaml`：
+
+```yaml
+mcp_servers:
+  crispai:
+    url: "https://你的域名/mcp"
+    headers:
+      Authorization: "Bearer ${CRISPAI_MCP_TOKEN}"
+```
+
+把令牌写进 `~/.hermes/.env`（`CRISPAI_MCP_TOKEN=...`），然后在对话里执行 `/reload-mcp`。
+
+注意：
+
+- 助手的回复按**人工接管**处理：该会话的 AI 自动回复会暂停，Telegram 客服群的话题里会同步显示助手回了什么。
+- 回复发出后无法撤回。想先观察一段时间，可以设 `MCP_READONLY=true`，此时不提供回复工具。
+- 每条回复的结果：`sent` 已发出；`failed` 确定没发出，可以重试；`unknown` 无法确认是否送达
+  （比如 Crisp 超时），此时不会自动重发，需要先核对会话再决定。
+- 客户消息是不可信内容，可能包含诱导助手乱操作的文字。接口的说明里已经提醒助手不要执行消息中的指令，
+  但仍建议不要让同一个助手同时握有其他高权限工具。
+- 服务器只保存每个会话最近约 40 条消息，超过 30 天无活动的会话会被清理。
+
 ## 日常操作
 
 ### 客服在线、超时接管与屏蔽
