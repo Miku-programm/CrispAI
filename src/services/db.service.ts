@@ -2,6 +2,7 @@ import { SQL } from "bun";
 import path from "path";
 import logger from "@/services/logger.service";
 import { parseSupportConfig, type SupportConfig } from "@/types/support";
+import { trimThread } from "@/utils/thread";
 
 /**
  * Postgres 服务封装
@@ -58,10 +59,15 @@ const toSession = (row: any) => {
   return row;
 };
 
-// 去掉值为 undefined 的键，避免把没传的字段更新成 null
+// 去掉值为 undefined 的键，避免把没传的字段更新成 null。
+// 对话历史在这里统一限长，所有写入路径都不会让它无限增长
 const clean = (patch: Record<string, unknown>) =>
   Object.fromEntries(
-    Object.entries(patch).filter(([, value]) => value !== undefined),
+    Object.entries(patch)
+      .filter(([, value]) => value !== undefined)
+      .map(([key, value]) =>
+        key === "thread" && Array.isArray(value) ? [key, trimThread(value)] : [key, value],
+      ),
   );
 
 // ---------------------------------------------------------------------------

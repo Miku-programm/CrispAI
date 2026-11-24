@@ -21,6 +21,8 @@ import { customerAction, isSupportOnline, noticeIsDue } from "@/services/support
 import type { SupportAction } from "@/types/support";
 import logger from "@/services/logger.service";
 import { clip } from "@/utils/html";
+import { trimThread } from "@/utils/thread";
+import { allowAICall } from "@/services/aiBudget.service";
 import {
   isAllowedMediaUrl,
   MEDIA_DOWNLOAD_TIMEOUT,
@@ -161,7 +163,17 @@ export default {
         await crisp.composeMessage(website_id, session_id, true);
         const notice = isSupportOnline(project.support) && session.fallback_active
           ? project.support.timeout.message : project.support.offline.message;
-        content = await runAutomaticReply(session, job.data, project, action, canReply, true, notice);
+        try {
+          content = await runAutomaticReply(session, job.data, project, action, canReply, true, notice);
+        } catch (error) {
+          // 自动回复失败（模型接口报错、Crisp 发送失败等）不能悄无声息：
+          // 客户这条消息没人回，必须让客服知道。历史照常保存，任务不再整体失败
+          logger.error("自动回复失败", {
+            session: cleanSessionId,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          await notifyFailure(session, "⚠️ 这条消息的自动回复失败，客户尚未收到回复，请人工处理。");
+        }
       }
       if (isText && project.telegramId) {
         await notifyTelegram(session, job.data.content, content, telegramMessage);
@@ -367,6 +379,11 @@ async function handleAIReply(session: Session, body: any, project: any, canReply
     project,
     record,
   );
+  // 超过会话的 AI 调用频率上限时不再调用模型（消息已记入历史，客服仍能在 Telegram 看到）
+  if (!(await allowAICall(body.website_id, session.session_id))) {
+    logger.warn("会话 AI 调用过于频繁，本条不自动回复", { session: session.session_id });
+    return;
+  }
   const results = await searchDocuments(project.id, body.content);
   if (results && results.length > 0) {
     const docs: ChatCompletionMessageParam = {
@@ -440,7 +457,8 @@ async function buildMessages(
   });
   messages.push({ role: "user", content: JSON.stringify(profile) });
 
-  session?.thread.forEach((msg: any) => messages.push(msg));
+  // 只带最近的一段历史，见 utils/thread
+  trimThread(session?.thread).forEach((msg: any) => messages.push(msg));
 
   if (record && body.content && typeof body.content === "string") {
     const msg: ChatCompletionMessageParam = {
@@ -470,6 +488,10 @@ async function handleImageMessage(
     content: [{ type: "image_url", image_url: { url: body.content.url } }],
   };
   if (record) { messages.push(image); session.thread.push(image); }
+  if (!(await allowAICall(body.website_id, session.session_id))) {
+    logger.warn("会话 AI 调用过于频繁，本条不自动回复", { session: session.session_id });
+    return;
+  }
 
   const completion = await openai.chat.completions.create({
     messages,
@@ -572,6 +594,16 @@ export async function runAutomaticReply(
     return handleImageMessage(session, body, project, undefined, canReply, record);
   }
   if (record) recordCustomerMessage(session, body);
+}
+
+/** 在会话话题里提醒客服；提醒本身失败只记日志 */
+async function notifyFailure(session: Session, text: string) {
+  if (!session.group_id || !session.topic_id) return;
+  try {
+    await telegram.default.api.sendMessage(session.group_id, text, {
+      message_thread_id: session.topic_id,
+    });
+  } catch (error) { logger.warn("发送失败提醒未送达", { message: String(error) }); }
 }
 
 async function notifyTelegram(

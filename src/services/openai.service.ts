@@ -3,6 +3,9 @@ import OpenAI from "openai";
 const openai = new OpenAI({
   baseURL: Bun.env.OPENAI_URL,
   apiKey: Bun.env.OPENAI_KEY,
+  // SDK 默认等 10 分钟并重试 2 次。会话任务是串行的，上游卡住时不能把整条通道占这么久
+  timeout: 60_000,
+  maxRetries: 1,
 });
 
 // 对话模型，可换成任何 OpenAI 兼容接口支持的模型
