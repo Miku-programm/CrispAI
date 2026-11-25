@@ -21,7 +21,11 @@ docker compose up -d
 ```
 
 然后用反向代理（Caddy / Nginx / Traefik 等）把域名指到 `127.0.0.1:3000`（见下面「反向代理」），打开
-`https://你的域名/`，用 `ADMIN_USER` / `ADMIN_PASSWORD` 登录。数据库表在首次启动时自动创建。
+`https://你的域名/`，在登录页用 `ADMIN_USER` / `ADMIN_PASSWORD` 登录。数据库表在首次启动时自动创建。
+
+登录状态保存在浏览器 Cookie 里，有效期 7 天；打开 `https://你的域名/logout` 并点击确认即可退出登录。修改 `ADMIN_PASSWORD`
+后所有已登录的浏览器会自动失效。脚本和命令行工具仍然可以用 Basic 认证直接访问接口
+（例如 `curl -u admin:密码 https://你的域名/api/v1/projects`）。
 
 ### 反向代理
 

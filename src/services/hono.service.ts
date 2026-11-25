@@ -12,6 +12,7 @@ import { crispWebhook } from "@/services/crisp.service";
 import * as storage from "@/services/storage.service";
 import logger from "@/services/logger.service";
 import api from "@/api";
+import { hasSession, safeNext } from "@/services/session.service";
 import mcp from "@/mcp";
 
 // 管理页面的静态文件。前端源码不在这个仓库里，打包后的产物同步到 public/ 并随仓库提交
@@ -51,6 +52,26 @@ hono.get(`${storage.UPLOAD_ROUTE}/:name`, async (c) => {
 });
 // 访客网站引用的欢迎语脚本
 hono.get("/intro.js", serveStatic({ root: WEB_DIR }));
+
+// 登录页。自身和它用到的图标不需要认证；已登录时直接去目标页面
+const LOGIN_PAGE = path.join(import.meta.dir, "../../web/login.html");
+hono.get("/login", async (c) => {
+  if (hasSession(c)) return c.redirect(safeNext(c.req.query("next")));
+  c.header("Cache-Control", "no-store");
+  c.header("X-Frame-Options", "DENY");
+  c.header("Referrer-Policy", "same-origin");
+  return c.html(await Bun.file(LOGIN_PAGE).text());
+});
+// 退出登录的确认页。GET 本身不改变登录状态（否则任何网站放一个指向这里的链接就能把你登出），
+// 真正的退出由页面上的按钮向 /api/v1/logout 发 POST 完成
+const LOGOUT_PAGE = path.join(import.meta.dir, "../../web/logout.html");
+hono.get("/logout", async (c) => {
+  c.header("Cache-Control", "no-store");
+  c.header("X-Frame-Options", "DENY");
+  return c.html(await Bun.file(LOGOUT_PAGE).text());
+});
+hono.get("/favicon.ico", serveStatic({ root: WEB_DIR }));
+hono.get("/logo-simple.png", serveStatic({ root: WEB_DIR }));
 
 // 给外部 AI 助手用的 MCP 接口，自带 Bearer 令牌认证，见 mcp/index.ts
 hono.route("/mcp", mcp);

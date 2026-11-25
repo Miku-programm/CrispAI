@@ -2,9 +2,14 @@ import type { Context, Next } from "hono";
 import { basicAuth } from "hono/basic-auth";
 import { getConnInfo } from "hono/bun";
 import logger from "@/services/logger.service";
+import { hasSession, isSameSiteRequest } from "@/services/session.service";
 
 /**
- * 管理后台的 Basic 认证（单用户）
+ * 管理后台的认证（单用户）
+ *
+ * 两种方式都认：
+ * - 登录页登录后的 Cookie（浏览器用，见 services/session.service.ts）
+ * - Basic 认证（脚本、curl 等工具用，也兼容旧的访问方式）
  *
  * 账号密码来自环境变量 `ADMIN_USER`（默认 admin）/ `ADMIN_PASSWORD`。
  * 没配置 `ADMIN_PASSWORD` 时后台整体拒绝访问，而不是放行或让进程退出：
@@ -112,9 +117,31 @@ const sharedLimiter = new LoginLimiter(SHARED_SOURCE_MAX_FAILURES);
 export const limiterFor = (key: string, own = limiter, shared = sharedLimiter) =>
   isSharedSource(key) ? shared : own;
 
+/** 浏览器地址栏直接打开页面（而不是页面里的脚本在调接口） */
+const isPageNavigation = (c: Context) => {
+  if (c.req.method !== "GET") return false;
+  const mode = c.req.header("sec-fetch-mode");
+  if (mode) return mode === "navigate";
+  return (c.req.header("accept") ?? "").includes("text/html");
+};
+
 export const authMiddleware = async (c: Context, next: Next) => {
   if (!auth) {
     return c.json({ message: "未配置 ADMIN_PASSWORD，管理后台已禁用" }, 503);
+  }
+  if (hasSession(c)) {
+    if (!isSameSiteRequest(c)) return c.json({ message: "请求来源不被允许" }, 403);
+    return next();
+  }
+  if (!c.req.header("authorization")) {
+    // 打开页面：去登录页，登录后回到原来的地址
+    if (isPageNavigation(c)) {
+      const url = new URL(c.req.url);
+      return c.redirect("/login?next=" + encodeURIComponent(url.pathname + url.search));
+    }
+    // 页面里的脚本在调接口（登录过期了）：只回 401，不带 Basic 质询，否则浏览器会弹出原生密码框
+    if (c.req.header("sec-fetch-mode")) return c.json({ message: "未登录或登录已过期" }, 401);
+    // 其余（curl、脚本）走下面的 Basic 认证，由它返回带质询的 401
   }
   const key = clientKey(c);
   const limiter = limiterFor(key);
