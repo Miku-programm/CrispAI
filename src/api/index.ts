@@ -2,7 +2,14 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { bodyLimit } from "hono/body-limit";
 
-import { authMiddleware } from "@/middlewares/auth.middleware";
+import z from "zod";
+import { authMiddleware, clientKey, limiterFor } from "@/middlewares/auth.middleware";
+import {
+  checkCredentials,
+  endSession,
+  isSameSiteRequest,
+  startSession,
+} from "@/services/session.service";
 import introTask from "@/jobs/intro.task";
 import { enqueue } from "@/utils/queue";
 import { validate } from "@/api/validator";
@@ -55,6 +62,40 @@ api.post(
     return c.json({ message: "成功" });
   },
 );
+
+// 登录 / 退出：登录页调用，自身不需要已登录
+api.post(
+  "/login",
+  bodyLimit({ maxSize: 2 * 1024, onError: (c) => c.json({ message: "请求体过大" }, 413) }),
+  validate("json", z.object({ username: z.string().max(200), password: z.string().max(500) })),
+  async (c) => {
+    if (!Bun.env.ADMIN_PASSWORD) {
+      return c.json({ message: "未配置 ADMIN_PASSWORD，管理后台已禁用" }, 503);
+    }
+    if (!isSameSiteRequest(c)) return c.json({ message: "请求来源不被允许" }, 403);
+    // 和 Basic 认证共用同一套失败次数限制
+    const key = clientKey(c);
+    const limiter = limiterFor(key);
+    const wait = limiter.retryAfter(key);
+    if (wait > 0) {
+      c.header("Retry-After", String(Math.ceil(wait / 1000)));
+      return c.json({ message: "登录失败次数过多，请稍后再试", code: "too_many_attempts" }, 429);
+    }
+    const { username, password } = await c.req.json();
+    if (!checkCredentials(username, password)) {
+      limiter.fail(key);
+      return c.json({ message: "账号或密码不正确", code: "invalid_credentials" }, 401);
+    }
+    limiter.succeed(key);
+    return c.json({ message: "登录成功", secure: startSession(c) });
+  },
+);
+api.post("/logout", (c) => {
+  // 只接受本站页面发起的退出，别的网站不能替你退出登录
+  if (!isSameSiteRequest(c)) return c.json({ message: "请求来源不被允许" }, 403);
+  endSession(c);
+  return c.json({ message: "已退出登录" });
+});
 
 api.use("*", authMiddleware);
 api.route("/support", supportApi);

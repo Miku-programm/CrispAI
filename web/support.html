@@ -58,7 +58,7 @@
   <main>
     <header>
       <div><div class="brand">CRISPAI / SUPPORT</div><h1>客服接待设置</h1></div>
-      <a href="/">返回原管理后台</a>
+      <nav><a href="/">返回原管理后台</a> · <a href="/logout" id="logout">退出登录</a></nav>
     </header>
     <section class="card">
       <div class="field"><label for="project">选择项目</label><select id="project" disabled><option>正在加载项目…</option></select></div>
@@ -324,6 +324,12 @@
         await loadProject();
       } catch (error) { tell(error.message, true); }
     })();
+  
+    // 直接在本页退出；脚本不可用时链接会打开 /logout 的确认页
+    document.getElementById("logout").addEventListener("click", async (event) => {
+      event.preventDefault();
+      try { await fetch("/api/v1/logout", { method: "POST" }); } finally { location.href = "/login"; }
+    });
   </script>
 </body>
 </html>
