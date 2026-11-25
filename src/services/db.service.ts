@@ -2,6 +2,7 @@ import { SQL } from "bun";
 import path from "path";
 import logger from "@/services/logger.service";
 import { parseSupportConfig, type SupportConfig } from "@/types/support";
+import { trimThread } from "@/utils/thread";
 
 /**
  * Postgres 服务封装
@@ -58,10 +59,15 @@ const toSession = (row: any) => {
   return row;
 };
 
-// 去掉值为 undefined 的键，避免把没传的字段更新成 null
+// 去掉值为 undefined 的键，避免把没传的字段更新成 null。
+// 对话历史在这里统一限长，所有写入路径都不会让它无限增长
 const clean = (patch: Record<string, unknown>) =>
   Object.fromEntries(
-    Object.entries(patch).filter(([, value]) => value !== undefined),
+    Object.entries(patch)
+      .filter(([, value]) => value !== undefined)
+      .map(([key, value]) =>
+        key === "thread" && Array.isArray(value) ? [key, trimThread(value)] : [key, value],
+      ),
   );
 
 // ---------------------------------------------------------------------------
@@ -255,6 +261,65 @@ export const deleteSessionsBefore = async (before: Date) => {
     returning session_id`;
   await sql`delete from control_event where created_at < ${before}`;
   return rows.map((row: any) => row.session_id as string);
+};
+
+// ---------------------------------------------------------------------------
+// 给 MCP（外部助手）用的只读查询
+// ---------------------------------------------------------------------------
+
+export type AgentSessionStatus = "waiting_human" | "unanswered" | "blocked" | "all";
+
+/**
+ * 会话列表（不含完整历史，只带最后一条消息）。
+ * - waiting_human：客户最后一条消息之后还没有人工回复
+ * - unanswered：历史里最后一条是客户发的（AI 和人工都没回）
+ */
+export const listSessionsForAgent = async (options: {
+  websiteId?: string | null;
+  status: AgentSessionStatus;
+  since?: Date | null;
+  limit: number;
+  offset: number;
+}): Promise<any[]> => {
+  const websiteId = options.websiteId ?? null;
+  const since = options.since ?? null;
+  const status = options.status;
+  const rows = await sql`
+    select s.session_id, s.website_id, s.enable_reply, s.fallback_active,
+           s.last_customer_at, s.last_human_at, s.pending_since, s.created_at,
+           (s.topic_id is not null) as has_telegram_topic,
+           jsonb_array_length(s.thread) as message_count,
+           s.thread -> -1 as last_message,
+           (b.session_id is not null) as blocked
+    from session s
+    left join blocked_session b
+      on b.website_id = s.website_id and b.session_id = s.session_id
+    where (${websiteId}::text is null or s.website_id = ${websiteId}::text)
+      and (${since}::timestamptz is null
+           or coalesce(s.last_customer_at, s.created_at) >= ${since}::timestamptz)
+      and (
+        ${status}::text = 'all'
+        or (${status}::text = 'blocked' and b.session_id is not null)
+        or (${status}::text = 'waiting_human' and b.session_id is null
+            and s.last_customer_at is not null
+            and (s.last_human_at is null or s.last_human_at < s.last_customer_at))
+        or (${status}::text = 'unanswered' and b.session_id is null
+            and s.thread -> -1 ->> 'role' = 'user')
+      )
+    order by coalesce(s.last_customer_at, s.created_at) desc
+    limit ${options.limit} offset ${options.offset}`;
+  return rows.map((row: any) => row);
+};
+
+export const getSessionsByIds = async (sessionIds: string[]): Promise<any[]> => {
+  if (sessionIds.length === 0) return [];
+  const rows = await sql`
+    select s.*, (b.session_id is not null) as blocked
+    from session s
+    left join blocked_session b
+      on b.website_id = s.website_id and b.session_id = s.session_id
+    where s.session_id in ${sql(sessionIds)}`;
+  return rows.map(toSession);
 };
 
 const normalizeSessionId = (sessionId: string) =>

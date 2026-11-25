@@ -12,6 +12,7 @@ import { crispWebhook } from "@/services/crisp.service";
 import * as storage from "@/services/storage.service";
 import logger from "@/services/logger.service";
 import api from "@/api";
+import mcp from "@/mcp";
 
 // 管理页面的静态文件。前端源码不在这个仓库里，打包后的产物同步到 public/ 并随仓库提交
 const WEB_DIR = Bun.env.WEB_DIR
@@ -50,6 +51,9 @@ hono.get(`${storage.UPLOAD_ROUTE}/:name`, async (c) => {
 });
 // 访客网站引用的欢迎语脚本
 hono.get("/intro.js", serveStatic({ root: WEB_DIR }));
+
+// 给外部 AI 助手用的 MCP 接口，自带 Bearer 令牌认证，见 mcp/index.ts
+hono.route("/mcp", mcp);
 
 // /api/v1 里除 intro 外都需要认证，见 api/index.ts
 hono.route("/api/v1", api);

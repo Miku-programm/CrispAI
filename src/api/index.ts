@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import z from "zod";
+import { bodyLimit } from "hono/body-limit";
 
 import { authMiddleware } from "@/middlewares/auth.middleware";
 import introTask from "@/jobs/intro.task";
@@ -11,6 +11,14 @@ import * as option from "@/api/option.controller";
 import * as payload from "@/api/payload.controller";
 import * as transfer from "@/api/transfer.controller";
 import supportApi from "@/api/support.controller";
+import * as db from "@/services/db.service";
+import { connection } from "@/services/redis.service";
+import {
+  allowIntro,
+  INTRO_BODY_LIMIT,
+  INTRO_JOB_OPTIONS,
+  introSchema,
+} from "@/services/introGuard.service";
 
 /**
  * 管理后台接口（/api/v1）
@@ -29,12 +37,21 @@ const introCors = cors({
 api.use("/intro", introCors);
 api.post(
   "/intro",
-  validate(
-    "json",
-    z.object({ website_id: z.string().min(1), session_id: z.string().min(1) }),
-  ),
+  bodyLimit({
+    maxSize: INTRO_BODY_LIMIT,
+    onError: (c) => c.json({ message: "请求体过大" }, 413),
+  }),
+  validate("json", introSchema),
   async (c) => {
-    await enqueue(introTask.queue, "intro", await c.req.json());
+    // 只取校验过的两个字段入队，请求里多带的任何内容都不会进 Redis
+    const data = introSchema.parse(await c.req.json());
+    // 不认识的站点、被限流或短时间内重复的请求都直接丢弃，统一返回成功，不向调用方暴露原因
+    if (
+      (await db.getProject(data.website_id)) &&
+      (await allowIntro(connection, data))
+    ) {
+      await enqueue(introTask.queue, "intro", data, INTRO_JOB_OPTIONS);
+    }
     return c.json({ message: "成功" });
   },
 );

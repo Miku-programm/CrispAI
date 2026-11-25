@@ -10,6 +10,7 @@ COPY src ./src
 COPY db ./db
 COPY public ./public
 COPY web ./web
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 ENV NODE_ENV=production \
     PORT=3000 \
@@ -18,4 +19,6 @@ VOLUME /data
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD bun -e "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+# 入口脚本负责修正数据卷属主并降权到 bun 用户，应用本身不再以 root 运行
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["bun", "run", "index.ts"]

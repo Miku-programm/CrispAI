@@ -8,6 +8,7 @@ import { createResponse } from "@/utils/general";
 import axios from "axios";
 import { connection } from "@/services/redis.service";
 import { markHumanActivity } from "@/services/support.service";
+import logger from "@/services/logger.service";
 
 const currentFileName = path.basename(
   import.meta.url,
@@ -31,6 +32,34 @@ export default {
   }),
   concurrency: 100,
   processor: async (job: any) => {
+    try {
+      return await deliver(job);
+    } catch (error) {
+      // 发给客户失败时任务不会自动重试（重试可能把已发出的部分再发一遍），
+      // 所以必须明确提醒客服，而不是只少一个 👌。
+      // 出错的位置可能在发出文字之后（比如图片上传失败、写历史失败），所以不能断言“没送到”
+      logger.error("客服回复未能送达客户", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+      try {
+        await telegram.default.api.sendMessage(
+          job.data.chat.id,
+          "⚠️ 这条消息可能没有（或只有一部分）发送给客户。请先在 Crisp 里确认客户实际收到了什么，再决定是否重发。",
+          {
+            message_thread_id: job.data.message_thread_id,
+            reply_parameters: {
+              message_id: job.data.message_id,
+              allow_sending_without_reply: true,
+            },
+          },
+        );
+      } catch {}
+      throw error;
+    }
+  },
+};
+
+const deliver = async (job: any) => {
     const group_id = job.data.chat.id;
     const topic_id = job.data.message_thread_id!;
 
@@ -176,7 +205,6 @@ export default {
       }
     }
     return createResponse(true, "任务执行成功");
-  },
 };
 
 const uploadFile = async (fileId: string) => {

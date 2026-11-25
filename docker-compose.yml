@@ -8,7 +8,9 @@ services:
       REDIS_URL: redis://redis:6379/0
       PORT: 3000
     ports:
-      - "${PORT:-3000}:3000"
+      # 默认只监听本机，由反向代理转发。直接写 "3000:3000" 会绑定所有网卡，
+      # 而且 Docker 会绕过 ufw 等防火墙，后台就能被人从公网用明文 HTTP 直接访问
+      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-3000}:3000"
     volumes:
       - upload:/data/upload
     depends_on:
