@@ -78,10 +78,44 @@ hono.route("/mcp", mcp);
 
 // /api/v1 里除 intro 外都需要认证，见 api/index.ts
 hono.route("/api/v1", api);
-hono.get("/support", authMiddleware, async (c) =>
-  c.html(await Bun.file(path.join(import.meta.dir, "../../web/support.html")).text()),
-);
-hono.get("/support/", authMiddleware, (c) => c.redirect("/support"));
+// 客服接待设置原来是单独的 /support 页面，现在是项目管理页里的「客服接待」标签。
+// 旧地址保留为跳转，已有的书签不会失效
+hono.get("/support", authMiddleware, (c) => c.redirect("/dashboard"));
+hono.get("/support/", authMiddleware, (c) => c.redirect("/dashboard"));
+
+// 后台的补充脚本（「客服接待」标签、退出登录按钮），由下面的 mountWeb 注入到后台页面
+const EXTRAS_SCRIPT = path.join(import.meta.dir, "../../web/dashboard-extras.js");
+export const EXTRAS_TAG = '<script src="/dashboard-extras.js" defer></script>';
+hono.get("/dashboard-extras.js", authMiddleware, async (c) => {
+  c.header("Content-Type", "text/javascript; charset=utf-8");
+  // 每次都向服务器确认，升级后不会继续用旧脚本
+  c.header("Cache-Control", "no-cache");
+  return c.body(await Bun.file(EXTRAS_SCRIPT).text());
+});
+
+/**
+ * 请求的是不是后台的某个页面（前端打包产物里的 index.html），是的话返回文件路径。
+ * 只认不带扩展名的路径，并确认解析后的位置仍在 WEB_DIR 里
+ */
+export const dashboardPageFile = async (pathname: string): Promise<string | null> => {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
+  if (decoded.includes("\0") || /\.[^/]*$/.test(decoded)) return null;
+  const file = path.resolve(WEB_DIR, "." + path.posix.normalize("/" + decoded), "index.html");
+  if (file !== path.join(WEB_DIR, "index.html") && !file.startsWith(WEB_DIR + path.sep)) return null;
+  return (await Bun.file(file).exists()) ? file : null;
+};
+
+/** 在页面末尾挂上补充脚本。前端重新打包同步过来后不用改任何文件，注入自动生效 */
+export const injectExtras = (html: string): string => {
+  if (html.includes(EXTRAS_TAG)) return html;
+  const index = html.lastIndexOf("</body>");
+  return index === -1 ? html + EXTRAS_TAG : html.slice(0, index) + EXTRAS_TAG + html.slice(index);
+};
 
 /**
  * 挂载管理页面。放在所有路由之后调用（index.ts 里 /jobs 挂完再调），
@@ -89,6 +123,11 @@ hono.get("/support/", authMiddleware, (c) => c.redirect("/support"));
  */
 export const mountWeb = () => {
   hono.use("*", authMiddleware);
+  hono.get("*", async (c, next) => {
+    const file = await dashboardPageFile(new URL(c.req.url).pathname);
+    if (!file) return next();
+    return c.html(injectExtras(await Bun.file(file).text()));
+  });
   hono.use("*", serveStatic({ root: WEB_DIR }));
   hono.notFound((c) => c.text("Not Found", 404));
 };
