@@ -89,10 +89,10 @@ export const supportConflictMessage = (
 ): string | null => {
   if (!config.enabled || enableAI) return null;
   if (config.offline.action === "ai") {
-    return "离线策略选择了 AI 接管，请先在原管理后台开启该项目的 AI 回复，或改用其他动作";
+    return "离线策略选择了 AI 接管，请先在「智能回复」里开启该项目的 AI 回复，或改用其他动作";
   }
   if (config.timeout.enabled && config.timeout.action === "ai") {
-    return "超时策略选择了 AI 接管，请先在原管理后台开启该项目的 AI 回复，或改用其他动作";
+    return "超时策略选择了 AI 接管，请先在「智能回复」里开启该项目的 AI 回复，或改用其他动作";
   }
   return null;
 };

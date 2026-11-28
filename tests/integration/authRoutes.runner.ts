@@ -68,16 +68,33 @@ assert.equal((await request("/api/v1/support/block", false, {
 })).status, 401);
 assert.equal(writes, 0);
 passed++;
-const page = await request("/support", true);
-assert.equal(page.status, 200);
-assert.match(page.headers.get("Content-Type") ?? "", /text\/html/);
-const html = await page.text();
-assert.match(html, /客服/);
-assert.match(html, /fetch\("\/api\/v1"/);
+// The standalone page moved into the project page; old addresses still land in the dashboard.
+for (const url of ["/support", "/support/"]) {
+  const redirect = await request(url, true);
+  assert.equal(redirect.status, 302);
+  assert.equal(redirect.headers.get("Location"), "/dashboard");
+}
 passed++;
-const redirect = await request("/support/", true);
-assert.equal(redirect.status, 302);
-assert.equal(redirect.headers.get("Location"), "/support");
+// Dashboard pages are served with the extras script attached, exactly once, and only to signed-in users.
+for (const url of ["/", "/dashboard", "/dashboard/", "/dashboard/project", "/dashboard/project?id=abc"]) {
+  const page = await request(url, true);
+  assert.equal(page.status, 200, url);
+  assert.match(page.headers.get("Content-Type") ?? "", /text\/html/);
+  const html = await page.text();
+  assert.equal(html.split('<script src="/dashboard-extras.js" defer></script>').length, 2, url);
+  assert.ok(html.indexOf("dashboard-extras.js") < html.lastIndexOf("</body>"), url);
+}
+assert.equal((await request("/dashboard")).status, 401);
+assert.equal((await request("/dashboard-extras.js")).status, 401);
+const script = await request("/dashboard-extras.js", true);
+assert.equal(script.status, 200);
+assert.match(script.headers.get("Content-Type") ?? "", /javascript/);
+assert.match(await script.text(), /客服接待/);
+// Assets and unknown paths are not treated as pages.
+assert.doesNotMatch(await (await request("/intro.js", true)).text(), /dashboard-extras/);
+assert.equal((await request("/no-such-page", true)).status, 404);
+assert.equal((await request("/..%2f..%2fpackage.json", true)).status, 404);
+assert.equal((await request("/dashboard/..%2f..%2f..%2fetc", true)).status, 404);
 passed++;
 const settings = await request(`/api/v1/support?project_id=${project.id}`, true);
 assert.equal(settings.status, 200);
